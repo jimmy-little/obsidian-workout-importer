@@ -1,0 +1,151 @@
+{
+  "data": {
+    "workouts": [
+      {
+        "id": "SAMPLE-001",
+        "name": "Mind and Body",
+        "start": "2024-09-15 06:30:00 -0700",
+        "end": "2024-09-15 07:00:00 -0700",
+        "duration": 1800.0,
+        "location": "Indoor",
+        "activeEnergyBurned": {
+          "qty": 85.5,
+          "units": "kcal"
+        },
+        "intensity": {
+          "qty": 1.9,
+          "units": "kcal/hr·kg"
+        },
+        "temperature": {
+          "qty": 72.5,
+          "units": "degF"
+        },
+        "humidity": {
+          "qty": 55,
+          "units": "%"
+        },
+        "metadata": {}
+      },
+      {
+        "id": "SAMPLE-002",
+        "name": "Yoga",
+        "start": "2024-09-15 18:00:00 -0700",
+        "end": "2024-09-15 19:00:00 -0700",
+        "duration": 3600.0,
+        "location": "Indoor",
+        "activeEnergyBurned": {
+          "qty": 120.3,
+          "units": "kcal"
+        },
+        "intensity": {
+          "qty": 2.1,
+          "units": "kcal/hr·kg"
+        },
+        "metadata": {}
+      },
+      {
+        "id": "SAMPLE-003",
+        "name": "Functional Strength Training",
+        "start": "2024-09-16 06:00:00 -0700",
+        "end": "2024-09-16 06:45:00 -0700",
+        "duration": 2700.0,
+        "location": "Indoor",
+        "activeEnergyBurned": {
+          "qty": 145.8,
+          "units": "kcal"
+        },
+        "intensity": {
+          "qty": 3.2,
+          "units": "kcal/hr·kg"
+        },
+        "temperature": {
+          "qty": 68.0,
+          "units": "degF"
+        },
+        "metadata": {}
+      },
+      {
+        "id": "SAMPLE-004",
+        "name": "Traditional Strength Training",
+        "start": "2024-09-16 17:00:00 -0700",
+        "end": "2024-09-16 17:30:00 -0700",
+        "duration": 1800.0,
+        "activeEnergyBurned": {
+          "qty": 95.2,
+          "units": "kcal"
+        },
+        "intensity": {
+          "qty": 2.5,
+          "units": "kcal/hr·kg"
+        },
+        "metadata": {}
+      },
+      {
+        "id": "SAMPLE-005",
+        "name": "Indoor Run",
+        "start": "2024-09-17 07:00:00 -0700",
+        "end": "2024-09-17 07:30:00 -0700",
+        "duration": 1800.0,
+        "location": "Indoor",
+        "activeEnergyBurned": {
+          "qty": 250.7,
+          "units": "kcal"
+        },
+        "intensity": {
+          "qty": 6.5,
+          "units": "kcal/hr·kg"
+        },
+        "distance": {
+          "qty": 3.2,
+          "units": "mi"
+        },
+        "temperature": {
+          "qty": 65.0,
+          "units": "degF"
+        },
+        "humidity": {
+          "qty": 45,
+          "units": "%"
+        },
+        "metadata": {}
+      },
+      {
+        "id": "SAMPLE-006",
+        "name": "Indoor Cycling",
+        "start": "2024-09-17 12:00:00 -0700",
+        "end": "2024-09-17 12:25:00 -0700",
+        "duration": 1500.0,
+        "location": "Indoor",
+        "activeEnergyBurned": {
+          "qty": 180.4,
+          "units": "kcal"
+        },
+        "intensity": {
+          "qty": 6.8,
+          "units": "kcal/hr·kg"
+        },
+        "temperature": {
+          "qty": 70.0,
+          "units": "degF"
+        },
+        "metadata": {}
+      },
+      {
+        "id": "SAMPLE-007",
+        "name": "Other",
+        "start": "2024-09-18 08:00:00 -0700",
+        "end": "2024-09-18 08:20:00 -0700",
+        "duration": 1200.0,
+        "activeEnergyBurned": {
+          "qty": 75.0,
+          "units": "kcal"
+        },
+        "intensity": {
+          "qty": 2.0,
+          "units": "kcal/hr·kg"
+        },
+        "metadata": {}
+      }
+    ]
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "keyMappings": [
+    {
+      "jsonKey": "date",
+      "yamlKey": "date"
+    },
+    {
+      "jsonKey": "type",
+      "yamlKey": "type"
+    }
+  ],
+  "templates": [
+    {
+      "workoutType": "",
+      "templatePath": ""
+    }
+  ],
+  "defaultTemplatePath": ""
+}
