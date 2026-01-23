@@ -1,7 +1,7 @@
 {
 	"id": "workout-importer",
 	"name": "Workout Importer",
-	"version": "1.0.0",
+	"version": "0.1.001",
 	"minAppVersion": "0.15.0",
 	"description": "Import workouts into Obsidian",
 	"author": "",

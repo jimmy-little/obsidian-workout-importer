@@ -1,7 +1,16 @@
 import { copyFile, mkdir } from "fs/promises";
-import { join, dirname } from "path";
+import { join } from "path";
+import os from "os";
 
-const VAULT_PATH = "/Users/jimmy/Library/Mobile Documents/iCloud~md~obsidian/Documents/JimmyOS";
+const HOME_DIR = os.homedir();
+const VAULT_PATH = join(
+	HOME_DIR,
+	"Library",
+	"Mobile Documents",
+	"iCloud~md~obsidian",
+	"Documents",
+	"JimmyOS"
+);
 const PLUGIN_DIR = join(VAULT_PATH, ".obsidian", "plugins", "workout-importer");
 
 const filesToCopy = ["main.js", "manifest.json", "versions.json"];
