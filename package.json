@@ -8,7 +8,9 @@
 		"build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
 		"install": "node install.mjs",
 		"build:install": "npm run build && npm run install",
-		"version": "node version-bump.mjs && git add manifest.json versions.json"
+		"version": "node version-bump.mjs && git add manifest.json versions.json",
+		"release": "node release.mjs",
+		"release:dry": "node release.mjs --no-push"
 	},
 	"keywords": [],
 	"author": "",
