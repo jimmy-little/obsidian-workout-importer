@@ -1,4 +1,5 @@
 import { App, Modal, Notice, Plugin, PluginSettingTab, Setting, TFile, TFolder } from "obsidian";
+import JSZip from "jszip";
 
 interface KeyMapping {
 	jsonKey: string;
@@ -26,6 +27,8 @@ interface WorkoutImporterSettings {
 	deleteSourceAfterImport: boolean; // Move source file to vault .trash after successful processing
 	statsNotePathTemplate: string; // Path for health/stats notes: {year}, {month}, {date}
 	statsNoteBodyTemplatePath: string; // Optional note whose content is used as body below frontmatter for new stats notes
+	mapTileStyle: "osm" | "carto-dark" | "maptiler-fiord"; // Basemap style for route maps
+	maptilerApiKey: string; // Required for MapTiler Fiord style (free key at maptiler.com)
 }
 
 // --- AutoExport JSON structure (Health AutoExport) ---
@@ -50,7 +53,7 @@ export function isAutoExportJson(parsed: AutoExportParsed): boolean {
 	return parsed.workouts.length > 0 || (parsed.metrics?.length ?? 0) > 0 || (parsed.sleepAnalysis?.length ?? 0) > 0;
 }
 
-// --- FITINDEX CSV structure (scale body composition) ---
+// --- FITINDEX / RENPHO CSV structure (scale body composition) ---
 export interface FITINDEXRow {
 	date: string; // YYYY-MM-DD
 	time: string;
@@ -58,27 +61,41 @@ export interface FITINDEXRow {
 	weightLb?: number;
 	bmi?: number;
 	bodyFatPct?: number;
+	bodyFatMassLb?: number; // RENPHO: Body Fat Mass(lb)
 	fatFreeWeightKg?: number;
 	fatFreeWeightLb?: number;
 	subcutaneousFatPct?: number;
 	visceralFat?: number;
 	bodyWaterPct?: number;
+	bodyWaterMassLb?: number; // RENPHO: Body Water Mass(lb)
+	musclePct?: number; // RENPHO: Muscle Percentage(%)
 	skeletalMusclePct?: number;
 	muscleMassKg?: number;
 	muscleMassLb?: number;
 	boneMassKg?: number;
 	boneMassLb?: number;
 	proteinPct?: number;
+	proteinMassLb?: number; // RENPHO: Protein Mass(lb)
 	bmrKcal?: number;
 	metabolicAge?: number;
+	whr?: number; // RENPHO: Waist-to-Hip Ratio
+	optimalWeightLb?: number; // RENPHO: Optimal Weight(lb)
+	weightLevel?: string; // RENPHO: e.g. "Obesity level Ⅰ"
+	bodyType?: string; // RENPHO: e.g. "Overweight"
 	[key: string]: string | number | undefined;
 }
 
-/** Parse date from "MM/DD/YYYY" or "MM/DD/YYYY, HH:MM:SS" or "YYYY-MM-DD" -> YYYY-MM-DD */
+/** Parse date from "MM/DD/YYYY", "MM/DD/YY", "MM/DD/YYYY, HH:MM:SS", or "YYYY-MM-DD" -> YYYY-MM-DD */
 function parseFITINDEXDate(raw: string): string {
 	const mmddyyyy = raw.match(/(\d{1,2})\/(\d{1,2})\/(\d{4})/);
 	if (mmddyyyy) {
 		const [, m, d, y] = mmddyyyy;
+		return `${y}-${m.padStart(2, "0")}-${d.padStart(2, "0")}`;
+	}
+	const mmddyy = raw.match(/(\d{1,2})\/(\d{1,2})\/(\d{2})/);
+	if (mmddyy) {
+		const [, m, d, y2] = mmddyy;
+		const y = parseInt(y2, 10) < 50 ? `20${y2}` : `19${y2}`;
 		return `${y}-${m.padStart(2, "0")}-${d.padStart(2, "0")}`;
 	}
 	const yyyymmdd = raw.match(/^(\d{4})-(\d{2})-(\d{2})/);
@@ -112,7 +129,9 @@ function applyFITINDEXByIndex(row: FITINDEXRow, values: string[]): void {
 	if (row.metabolicAge == null) row.metabolicAge = parseNum(raw(13));
 }
 
-export function parseFITINDEXCsv(csvText: string): FITINDEXRow[] {
+/** Parse body composition CSV (FITINDEX or RENPHO). When indexFallback is true (FITINDEX), also apply column-index fallback. */
+export function parseFITINDEXCsv(csvText: string, options?: { indexFallback?: boolean }): FITINDEXRow[] {
+	const indexFallback = options?.indexFallback !== false;
 	const lines = csvText.trim().split(/\r?\n/).filter((line) => line.trim());
 	if (lines.length < 2) return [];
 
@@ -127,30 +146,42 @@ export function parseFITINDEXCsv(csvText: string): FITINDEXRow[] {
 		for (let c = 0; c < headers.length && c < values.length; c++) {
 			const key = norm(headers[c]);
 			const raw = values[c]?.trim() ?? "";
-			if (key === "Time" || key === "Time of Measurement") {
+			// Date (RENPHO: separate column e.g. "3/14/26")
+			if (key === "Date") {
+				const parsed = parseFITINDEXDate(raw);
+				if (parsed) row.date = parsed;
+			} else if (key === "Time" || key === "Time of Measurement") {
 				row.time = raw.replace(/^["']|["']$/g, "");
-				row.date = parseFITINDEXDate(row.time) || (row.time.match(/^\d{4}-\d{2}-\d{2}/) ? row.time.slice(0, 10) : "");
+				if (!row.date) row.date = parseFITINDEXDate(row.time) || (row.time.match(/^\d{4}-\d{2}-\d{2}/) ? row.time.slice(0, 10) : "");
 			} else if (key === "Weight (kg)") row.weightKg = parseNum(raw);
 			else if (key === "Weight(lb)" || key === "Weight (lb)") row.weightLb = parseNum(raw);
 			else if (key === "BMI") row.bmi = parseNum(raw);
-			else if (key === "Body Fat (%)" || key === "Body Fat(%)") row.bodyFatPct = parseNum(raw);
+			else if (key === "Body Fat (%)" || key === "Body Fat(%)" || key === "Body Fat Percentage (%)" || key === "Body Fat Percentage(%)") row.bodyFatPct = parseNum(raw);
+			else if (key === "Body Fat Mass(lb)" || key === "Body Fat Mass (lb)") row.bodyFatMassLb = parseNum(raw);
 			else if (key === "Fat-free Body Weight (kg)") row.fatFreeWeightKg = parseNum(raw);
-			else if (key === "Fat-free Body Weight(lb)" || key === "Fat-free Body Weight (lb)") row.fatFreeWeightLb = parseNum(raw);
+			else if (key === "Fat-free Body Weight(lb)" || key === "Fat-free Body Weight (lb)" || key === "Fat-Free Mass (lb)" || key === "Fat-Free Mass(lb)") row.fatFreeWeightLb = parseNum(raw);
 			else if (key === "Subcutaneous Fat (%)" || key === "Subcutaneous Fat(%)") row.subcutaneousFatPct = parseNum(raw);
 			else if (key === "Visceral Fat") row.visceralFat = parseNum(raw);
-			else if (key === "Body Water (%)" || key === "Body Water(%)") row.bodyWaterPct = parseNum(raw);
-			else if (key === "Skeletal Muscle (%)" || key === "Skeletal Muscle(%)") row.skeletalMusclePct = parseNum(raw);
+			else if (key === "Body Water (%)" || key === "Body Water(%)" || key === "Body Water Percentage (%)" || key === "Body Water Percentage(%)") row.bodyWaterPct = parseNum(raw);
+			else if (key === "Body Water Mass(lb)" || key === "Body Water Mass (lb)") row.bodyWaterMassLb = parseNum(raw);
+			else if (key === "Muscle Percentage (%)" || key === "Muscle Percentage(%)") row.musclePct = parseNum(raw);
+			else if (key === "Skeletal Muscle (%)" || key === "Skeletal Muscle(%)" || key === "Skeletal Muscle Percentage (%)" || key === "Skeletal Muscle Percentage(%)") row.skeletalMusclePct = parseNum(raw);
 			else if (key === "Muscle Mass (kg)") row.muscleMassKg = parseNum(raw);
-			else if (key === "Muscle Mass(lb)" || key === "Muscle Mass (lb)") row.muscleMassLb = parseNum(raw);
+			else if (key === "Muscle Mass(lb)" || key === "Muscle Mass (lb)" || key === "Skeletal Muscle Mass(lb)" || key === "Skeletal Muscle Mass (lb)") row.muscleMassLb = parseNum(raw);
 			else if (key === "Bone Mass (kg)") row.boneMassKg = parseNum(raw);
 			else if (key === "Bone Mass(lb)" || key === "Bone Mass (lb)") row.boneMassLb = parseNum(raw);
-			else if (key === "Protein (%)" || key === "Protein(%)") row.proteinPct = parseNum(raw);
+			else if (key === "Protein (%)" || key === "Protein(%)" || key === "Protein Percentage (%)" || key === "Protein Percentage(%)") row.proteinPct = parseNum(raw);
+			else if (key === "Protein Mass(lb)" || key === "Protein Mass (lb)") row.proteinMassLb = parseNum(raw);
 			else if (key === "BMR (kcal)" || key === "BMR(kcal)") row.bmrKcal = parseNum(raw);
 			else if (key === "Metabolic Age") row.metabolicAge = parseNum(raw);
+			else if (key === "WHR (Waist-to-Hip Ratio)" || key === "WHR") row.whr = parseNum(raw);
+			else if (key === "Optimal Weight(lb)" || key === "Optimal Weight (lb)") row.optimalWeightLb = parseNum(raw);
+			else if (key === "Weight Level") row.weightLevel = raw.replace(/^["']|["']$/g, "").trim() || undefined;
+			else if (key === "Body Type") row.bodyType = raw.replace(/^["']|["']$/g, "").trim() || undefined;
 		}
 
-		// Fallback: map by column index so we get all fields even if header text differs
-		applyFITINDEXByIndex(row, values);
+		// Fallback: map by column index (FITINDEX column order only)
+		if (indexFallback) applyFITINDEXByIndex(row, values);
 
 		if (row.date) rows.push(row);
 	}
@@ -188,8 +219,91 @@ export function isFITINDEXCsvFileName(fileName: string): boolean {
 	return fileName.toUpperCase().includes("FITINDEX") && fileName.toLowerCase().endsWith(".csv");
 }
 
+/** RENPHO scale body composition CSV (e.g. RENPHO Health-Jimmy.csv). */
+export function isRENPHOCsvFileName(fileName: string): boolean {
+	return fileName.toUpperCase().includes("RENPHO") && fileName.toLowerCase().endsWith(".csv");
+}
+
+/** HealthAutoExport Workouts CSV (e.g. Workouts-20260101_000000-20260216_235959.csv). */
+export function isHealthAutoExportWorkoutsCsv(fileName: string): boolean {
+	return fileName.startsWith("Workouts-") && fileName.toLowerCase().endsWith(".csv");
+}
+
+/** Parse "HH:MM:SS" or "H:MM:SS" to seconds. */
+function parseDurationToSeconds(s: string): number {
+	const parts = (s || "").trim().split(":").map((p) => parseInt(p, 10) || 0);
+	if (parts.length >= 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+	if (parts.length === 2) return parts[0] * 60 + parts[1];
+	return parts[0] || 0;
+}
+
+/** Parse HealthAutoExport Workouts CSV into workout objects for processWorkout. */
+export function parseHealthAutoExportWorkoutsCsv(csvText: string): any[] {
+	const lines = csvText.trim().split(/\r?\n/).filter((l) => l.trim());
+	if (lines.length < 2) return [];
+	const headerLine = lines[0];
+	const headers = parseCsvLine(headerLine).map((h) => h.trim().toLowerCase());
+	const col = (name: string) => headers.findIndex((h) => h.includes(name.toLowerCase()));
+	const idxType = col("workout type") >= 0 ? col("workout type") : 0;
+	const idxStart = col("start") >= 0 ? col("start") : 1;
+	const idxEnd = col("end") >= 0 ? col("end") : 2;
+	const idxDuration = col("duration") >= 0 ? col("duration") : 3;
+	const idxActiveEnergy = col("active energy") >= 0 ? col("active energy") : 4;
+	const idxRestingEnergy = col("resting energy") >= 0 ? col("resting energy") : -1;
+	const idxIntensity = col("intensity") >= 0 ? col("intensity") : -1;
+	const idxMaxHr = headers.findIndex((h) => h.includes("max") && h.includes("heart"));
+	const idxAvgHr = headers.findIndex((h) => h.includes("avg") && h.includes("heart"));
+	const idxDistance = col("distance") >= 0 ? col("distance") : -1;
+	const idxSteps = col("step count") >= 0 ? col("step count") : -1;
+	const idxFlights = col("flights") >= 0 ? col("flights") : -1;
+	const idxLocation = col("location") >= 0 ? col("location") : -1;
+	const workouts: any[] = [];
+	for (let i = 1; i < lines.length; i++) {
+		const values = parseCsvLine(lines[i]);
+		const get = (idx: number) => (idx >= 0 && values[idx] !== undefined ? values[idx].trim() : "");
+		const getNum = (idx: number) => (idx >= 0 && values[idx] !== undefined ? parseFloat(values[idx]) : undefined);
+		const name = get(idxType) || "Unknown";
+		const start = get(idxStart);
+		if (!start) continue;
+		const end = get(idxEnd);
+		const durationStr = get(idxDuration);
+		const durationSec = durationStr ? parseDurationToSeconds(durationStr) : undefined;
+		const activeKcal = getNum(idxActiveEnergy);
+		const workout: any = {
+			name,
+			start,
+			end: end || undefined,
+			duration: durationSec,
+			activeEnergyBurned: activeKcal != null ? { qty: activeKcal, units: "kcal" } : undefined,
+			calories: activeKcal,
+		};
+		if (getNum(idxRestingEnergy) != null) workout.restingEnergy = { qty: getNum(idxRestingEnergy), units: "kcal" };
+		if (getNum(idxIntensity) != null) workout.intensity = { qty: getNum(idxIntensity), units: "kcal/hr·kg" };
+		if (getNum(idxMaxHr) != null) workout.heartRateMax = getNum(idxMaxHr);
+		if (getNum(idxAvgHr) != null) workout.heartRateAvg = getNum(idxAvgHr);
+		if (getNum(idxDistance) != null) workout.distance = { qty: getNum(idxDistance), units: "km" };
+		if (getNum(idxSteps) != null) workout.stepCount = getNum(idxSteps);
+		if (getNum(idxFlights) != null) workout.flightsClimbed = getNum(idxFlights);
+		if (get(idxLocation)) workout.location = get(idxLocation);
+		workouts.push(workout);
+	}
+	return workouts;
+}
+
 // --- Stats notes path (template from settings) ---
 const DEFAULT_STATS_PATH_TEMPLATE = "60 Logs/{year}/Stats/{month}/{date}.md";
+
+// --- Routes: track data + map PNG stored by workoutId (stable even if note is renamed) ---
+const ROUTES_FOLDER = "routes";
+
+export interface RoutePoint {
+	lat: number;
+	lon: number;
+	speed: number; // m/s
+}
+
+// TODO: If this plugin is ever distributed beyond personal use, add a check to prevent mixing
+// JSON (Health AutoExport) and CSV (HealthAutoExport Workouts CSV) workout sources in the same vault.
 
 // --- Activity icons for Apple-style workout banners (98 Assets/images/activityIcons/*.png) ---
 const ACTIVITY_ICONS_FOLDER = "98 Assets/images/activityIcons";
@@ -247,6 +361,28 @@ export function getStatsNotePath(date: Date, pathTemplate: string): string {
 		"-" +
 		date.getDate().toString().padStart(2, "0");
 	return template.replace(/\{year\}/g, year).replace(/\{month\}/g, month).replace(/\{date\}/g, dateStr);
+}
+
+/** Generate a stable UUID from workout identity (name + start). Same workout always gets same id. */
+export function workoutIdFromWorkout(workout: { name?: string; start?: string }): string {
+	const name = (workout?.name ?? "").trim() || "Unknown";
+	const start = (workout?.start ?? "").toString().trim().slice(0, 19);
+	const key = `${name}|${start}`;
+	// Simple hash -> 32 hex chars, format as UUID 8-4-4-4-12
+	let h = 0;
+	for (let i = 0; i < key.length; i++) {
+		const c = key.charCodeAt(i);
+		h = (h << 5) - h + c;
+		h = h >>> 0;
+	}
+	const hex = (h >>> 0).toString(16).padStart(8, "0");
+	// Second 8 from string hash
+	let h2 = 5381;
+	for (let i = 0; i < key.length; i++) h2 = (h2 * 33) ^ key.charCodeAt(i);
+	const hex2 = (h2 >>> 0).toString(16).padStart(8, "0");
+	const hex3 = (key.length + h + h2).toString(16).padStart(8, "0").slice(-8);
+	const hex4 = (h ^ h2).toString(16).padStart(8, "0").slice(-8);
+	return `${hex}-${hex2.slice(0, 4)}-${hex2.slice(4, 8)}-${hex3}-${hex4}${hex.slice(0, 4)}`;
 }
 
 /** Convert snake_case to camelCase; used for frontmatter keys (e.g. body_fat_percentage -> bodyFatPercentage). */
@@ -358,6 +494,8 @@ const DEFAULT_SETTINGS: WorkoutImporterSettings = {
 	deleteSourceAfterImport: true,
 	statsNotePathTemplate: "60 Logs/{year}/Stats/{month}/{date}.md",
 	statsNoteBodyTemplatePath: "",
+	mapTileStyle: "maptiler-fiord",
+	maptilerApiKey: "",
 };
 
 export default class WorkoutImporterPlugin extends Plugin {
@@ -410,22 +548,71 @@ export default class WorkoutImporterPlugin extends Plugin {
 		await this.saveData(this.settings);
 	}
 
+	/** Decompress a ZIP in the vault into baseFolder/{zipBasename}/. Extracts only text files (csv, json, gpx, xml, txt, md). */
+	async expandZipToVault(zipFile: TFile, baseFolder: string): Promise<void> {
+		const zipBasename = zipFile.basename;
+		const extractRoot = baseFolder ? `${baseFolder}/${zipBasename}` : zipBasename;
+		const url = this.app.vault.getResourcePath(zipFile);
+		const response = await fetch(url);
+		if (!response.ok) throw new Error(`Failed to read zip: ${response.status}`);
+		const arrayBuffer = await response.arrayBuffer();
+		const zip = await JSZip.loadAsync(arrayBuffer);
+		const textExtensions = new Set(["csv", "json", "gpx", "xml", "txt", "md"]);
+		for (const [entryPath, entry] of Object.entries(zip.files) as [string, { dir: boolean; async(s: string): Promise<string> }][]) {
+			if (entry.dir) continue;
+			const normalized = entryPath.replace(/\\/g, "/").replace(/\/+/g, "/");
+			if (normalized.includes("..")) continue;
+			const ext = (normalized.split(".").pop() || "").toLowerCase();
+			if (!textExtensions.has(ext)) continue;
+			const content = await entry.async("string");
+			const vaultPath = baseFolder ? `${extractRoot}/${normalized}` : `${zipBasename}/${normalized}`;
+			const parts = vaultPath.split("/");
+			for (let i = 1; i < parts.length; i++) {
+				const dirPath = parts.slice(0, i).join("/");
+				if (!this.app.vault.getAbstractFileByPath(dirPath)) {
+					await this.app.vault.createFolder(dirPath);
+				}
+			}
+			try {
+				await this.app.vault.create(vaultPath, content);
+			} catch (e) {
+				// File may already exist (e.g. re-run); skip
+				if (!String(e).includes("already exists")) throw e;
+			}
+		}
+	}
+
 	async scanAndImport(): Promise<void> {
 		const folder = this.settings.scanFolderPath?.trim() || "";
-		const allFiles = this.app.vault.getFiles();
+		let allFiles = this.app.vault.getFiles();
+		// Decompress any ZIPs in scope first so we can process their contents
+		const inScope = (f: TFile) => !folder || f.path === folder || f.path.startsWith(folder + "/");
+		const zips = allFiles.filter((f) => inScope(f) && (f.extension || "").toLowerCase() === "zip");
+		for (const zipFile of zips) {
+			try {
+				await this.expandZipToVault(zipFile, folder);
+				allFiles = this.app.vault.getFiles();
+				if (this.settings.deleteSourceAfterImport) {
+					await this.app.vault.trash(zipFile, false);
+				}
+			} catch (err) {
+				new Notice(`Failed to extract ${zipFile.name}: ${err}`);
+			}
+		}
 		const toProcess = allFiles.filter((f) => {
-			const inScope = !folder || f.path === folder || f.path.startsWith(folder + "/");
-			if (!inScope) return false;
+			if (!inScope(f)) return false;
 			const ext = (f.extension || "").toLowerCase();
 			if (ext === "json") return true;
 			if (ext === "csv" && isFITINDEXCsvFileName(f.name)) return true;
+			if (ext === "csv" && isRENPHOCsvFileName(f.name)) return true;
+			if (ext === "csv" && isHealthAutoExportWorkoutsCsv(f.name)) return true;
 			return false;
 		});
 		if (toProcess.length === 0) {
 			new Notice(
 				folder
-					? `No JSON or FITINDEX CSV files found in ${folder}`
-					: "No JSON or FITINDEX CSV files found in vault"
+					? `No JSON, FITINDEX/RENPHO CSV, or Workouts CSV found in ${folder}`
+					: "No JSON, FITINDEX/RENPHO CSV, or Workouts CSV found in vault"
 			);
 			return;
 		}
@@ -469,13 +656,25 @@ export default class WorkoutImporterPlugin extends Plugin {
 					success += result.success;
 					errors += result.errors;
 					processed = true;
-				} else if (ext === "csv" && isFITINDEXCsvFileName(file.name)) {
-					const rows = parseFITINDEXCsv(text);
+				} else if (ext === "csv" && (isFITINDEXCsvFileName(file.name) || isRENPHOCsvFileName(file.name))) {
+					const rows = parseFITINDEXCsv(text, { indexFallback: isFITINDEXCsvFileName(file.name) });
 					if (rows.length > 0) {
 						const n = await this.processFITINDEXToStatsNotes(rows);
 						success += n;
 						processed = true;
 					}
+				} else if (ext === "csv" && isHealthAutoExportWorkoutsCsv(file.name)) {
+					const workouts = parseHealthAutoExportWorkoutsCsv(text);
+					for (const workout of workouts) {
+						try {
+							await this.processWorkout(workout);
+							success++;
+						} catch (error) {
+							console.error("Error processing workout from Workouts CSV:", error);
+							errors++;
+						}
+					}
+					processed = workouts.length > 0;
 				}
 				if (processed && this.settings.deleteSourceAfterImport) {
 					await this.app.vault.trash(file, false);
@@ -758,6 +957,15 @@ export default class WorkoutImporterPlugin extends Plugin {
 				if (row.proteinPct != null) updates["protein"] = row.proteinPct;
 				if (row.bmrKcal != null) updates["bmr"] = row.bmrKcal;
 				if (row.metabolicAge != null) updates["metabolicAge"] = row.metabolicAge;
+				// RENPHO-only / extra fields
+				if (row.bodyFatMassLb != null) updates["bodyFatMass"] = Math.round(row.bodyFatMassLb * 100) / 100;
+				if (row.musclePct != null) updates["musclePct"] = row.musclePct;
+				if (row.proteinMassLb != null) updates["proteinMass"] = Math.round(row.proteinMassLb * 100) / 100;
+				if (row.bodyWaterMassLb != null) updates["bodyWaterMass"] = Math.round(row.bodyWaterMassLb * 100) / 100;
+				if (row.whr != null) updates["whr"] = row.whr;
+				if (row.optimalWeightLb != null) updates["optimalWeight"] = Math.round(row.optimalWeightLb * 100) / 100;
+				if (row.weightLevel != null && row.weightLevel !== "") updates["weightLevel"] = row.weightLevel;
+				if (row.bodyType != null && row.bodyType !== "") updates["bodyType"] = row.bodyType;
 				const { path } = await this.getOrCreateStatsNote(date);
 				await this.mergeAndWriteStatsNote(path, updates, "");
 				count++;
@@ -835,13 +1043,61 @@ export default class WorkoutImporterPlugin extends Plugin {
 		if (this.settings.keyMappings.length === 0) {
 			Object.assign(mappedData, workout);
 		}
+		// Always set date from workout start (YYYY-MM-DD) in addition to start/end
+		const year = workoutDate.getFullYear();
+		const month = (workoutDate.getMonth() + 1).toString().padStart(2, "0");
+		const day = workoutDate.getDate().toString().padStart(2, "0");
+		mappedData["date"] = `${year}-${month}-${day}`;
+		// Stable ID so route data (routes/{id}.json, routes/{id}.png) stays linked even if note is renamed
+		mappedData["workoutId"] = workoutIdFromWorkout(workout);
 		const yamlFrontmatter = this.generateYAMLFrontmatter(
 			mappedData,
 			templatePath,
 			relativeImagePath,
 			workoutName
 		);
-		const noteContent = `---\n${yamlFrontmatter}---\n\n${templateContent}`;
+		let bodyContent = templateContent;
+		const workoutId = mappedData["workoutId"] as string;
+		const workoutStartKey = this.getWorkoutStartKey(workout);
+		if (workoutStartKey) {
+			const hrFile = this.getHeartRateCsvFile(workoutName, workoutStartKey);
+			if (hrFile) {
+				try {
+					const hrCsv = await this.app.vault.read(hrFile);
+					const { labels, data } = this.parseHeartRateCsv(hrCsv);
+					const chartBlock = this.buildChartsHeartRateBlock(labels, data);
+					if (chartBlock) bodyContent = (templateContent.trim() ? templateContent + "\n\n" : "") + chartBlock;
+				} catch (e) {
+					console.warn("Failed to read/parse Heart Rate CSV for chart:", hrFile.path, e);
+				}
+			}
+			// Route map: find Route CSV/GPX, save data and PNG in workout dir's routes/ folder, embed
+			const workoutDir = finalFilePath.includes("/") ? finalFilePath.split("/").slice(0, -1).join("/") : "";
+			const routesFolder = workoutDir ? `${workoutDir}/routes` : ROUTES_FOLDER;
+			const routeFile = this.getRouteFile(workoutName, workoutStartKey);
+			if (routeFile && workoutId) {
+				try {
+					const routeText = await this.app.vault.read(routeFile);
+					const points =
+						routeFile.extension.toLowerCase() === "gpx"
+							? this.parseRouteGpx(routeText)
+							: this.parseRouteCsv(routeText);
+					if (points.length >= 2) {
+						await this.saveRouteData(workoutId, points, routesFolder);
+						const mapDataUrl = await this.generateRouteMapImage(points);
+						if (mapDataUrl) {
+							const routeImagePath = `${routesFolder}/${workoutId}.png`;
+							await this.saveImageToPath(mapDataUrl, routeImagePath);
+							const routeSection = `\n\n## Route\n\n![[${routeImagePath}]]\n`;
+							bodyContent = bodyContent.trimEnd() + routeSection;
+						}
+					}
+				} catch (e) {
+					console.warn("Failed to process route for map:", routeFile.path, e);
+				}
+			}
+		}
+		const noteContent = `---\n${yamlFrontmatter}---\n\n${bodyContent}`;
 		if (existingAtPath && "content" in existingAtPath) {
 			await this.app.vault.modify(existingAtPath as unknown as TFile, noteContent);
 		} else {
@@ -870,12 +1126,338 @@ export default class WorkoutImporterPlugin extends Plugin {
 		return filePath;
 	}
 
-	/** Resolve workout type name to activity icon filename (no extension). */
-	getIconNameForWorkout(workoutName: string): string {
+	/** Workout start as YYYYMMDD_HHMMSS for matching sensor filenames (e.g. Outdoor Walk-Heart Rate-20260208_151937.csv). */
+	getWorkoutStartKey(workout: { start?: string }): string {
+		const start = workout?.start;
+		if (!start) return "";
+		const d = new Date(start);
+		if (isNaN(d.getTime())) return "";
+		const y = d.getFullYear();
+		const m = (d.getMonth() + 1).toString().padStart(2, "0");
+		const day = d.getDate().toString().padStart(2, "0");
+		const h = d.getHours().toString().padStart(2, "0");
+		const min = d.getMinutes().toString().padStart(2, "0");
+		const s = d.getSeconds().toString().padStart(2, "0");
+		return `${y}${m}${day}_${h}${min}${s}`;
+	}
+
+	/** Find Heart Rate CSV for this workout under the scan folder (same place as decompressed ZIP contents). */
+	getHeartRateCsvFile(workoutName: string, workoutStartKey: string): TFile | null {
+		const scanFolder = (this.settings.scanFolderPath ?? "").trim();
+		const prefix = `${workoutName}-Heart Rate-`;
+		const allFiles = this.app.vault.getFiles();
+		for (const f of allFiles) {
+			if (f.extension !== "csv" || !f.name.startsWith(prefix)) continue;
+			const inScope = !scanFolder || f.path === scanFolder || f.path.startsWith(scanFolder + "/");
+			if (!inScope) continue;
+			const stem = f.basename.slice(prefix.length);
+			if (stem === workoutStartKey || stem.startsWith(workoutStartKey.slice(0, 12))) return f;
+		}
+		return null;
+	}
+
+	/** Find Route CSV or GPX for this workout under the scan folder. */
+	getRouteFile(workoutName: string, workoutStartKey: string): TFile | null {
+		const scanFolder = (this.settings.scanFolderPath ?? "").trim();
+		const prefix = `${workoutName}-Route-`;
+		const allFiles = this.app.vault.getFiles();
+		for (const f of allFiles) {
+			const ext = (f.extension || "").toLowerCase();
+			if ((ext !== "csv" && ext !== "gpx") || !f.name.startsWith(prefix)) continue;
+			const inScope = !scanFolder || f.path === scanFolder || f.path.startsWith(scanFolder + "/");
+			if (!inScope) continue;
+			const stem = f.basename.slice(prefix.length);
+			if (stem === workoutStartKey || stem.startsWith(workoutStartKey.slice(0, 12))) return f;
+		}
+		return null;
+	}
+
+	/** Parse HealthAutoExport Route CSV: Timestamp, Latitude, Longitude, ..., Speed (m/s). */
+	parseRouteCsv(csvText: string): RoutePoint[] {
+		const points: RoutePoint[] = [];
+		const lines = csvText.trim().split(/\r?\n/).filter((l) => l.trim());
+		if (lines.length < 2) return points;
+		const headers = parseCsvLine(lines[0]).map((h) => h.trim().toLowerCase());
+		const idxLat = headers.findIndex((h) => h.includes("latitude") || h === "lat");
+		const idxLon = headers.findIndex((h) => h.includes("longitude") || h === "lon" || h === "lng");
+		const idxSpeed = headers.findIndex((h) => h.includes("speed"));
+		if (idxLat < 0 || idxLon < 0) return points;
+		for (let i = 1; i < lines.length; i++) {
+			const values = parseCsvLine(lines[i]);
+			const lat = parseFloat(values[idxLat]);
+			const lon = parseFloat(values[idxLon]);
+			if (Number.isNaN(lat) || Number.isNaN(lon)) continue;
+			const speed = idxSpeed >= 0 && values[idxSpeed] !== undefined ? parseFloat(values[idxSpeed]) : 0;
+			points.push({ lat, lon, speed: Number.isNaN(speed) ? 0 : speed });
+		}
+		return points;
+	}
+
+	/** Parse GPX track: trkpt with lat, lon, and optional extensions/speed. */
+	parseRouteGpx(gpxText: string): RoutePoint[] {
+		const points: RoutePoint[] = [];
+		const trkptRegex = /<trkpt\s+lat="([^"]+)"\s+lon="([^"]+)"[^>]*>([\s\S]*?)<\/trkpt>/gi;
+		const speedRegex = /<speed>([^<]+)<\/speed>/i;
+		let m: RegExpExecArray | null;
+		while ((m = trkptRegex.exec(gpxText)) !== null) {
+			const lat = parseFloat(m[1]);
+			const lon = parseFloat(m[2]);
+			if (Number.isNaN(lat) || Number.isNaN(lon)) continue;
+			const inner = m[3] || "";
+			const speedMatch = inner.match(speedRegex);
+			const speed = speedMatch ? parseFloat(speedMatch[1]) : 0;
+			points.push({ lat, lon, speed: Number.isNaN(speed) ? 0 : speed });
+		}
+		return points;
+	}
+
+	/** Parse HealthAutoExport Heart Rate CSV: Date/Time, Min, Max, Avg -> labels (time) and data (BPM). */
+	parseHeartRateCsv(csvText: string): { labels: string[]; data: number[] } {
+		const labels: string[] = [];
+		const data: number[] = [];
+		const lines = csvText.trim().split(/\r?\n/);
+		if (lines.length < 2) return { labels, data };
+		const header = lines[0].toLowerCase();
+		const avgIdx = header.includes("avg") ? header.split(",").findIndex((c) => c.includes("avg")) : -1;
+		const timeIdx = header.includes("date/time") ? 0 : header.split(",").findIndex((c) => c.includes("time"));
+		for (let i = 1; i < lines.length; i++) {
+			const parts = lines[i].split(",").map((p) => p.trim());
+			const timeStr = timeIdx >= 0 && parts[timeIdx] ? parts[timeIdx].trim().slice(11, 19) : ""; // HH:MM:SS or similar
+			const label = timeStr ? timeStr.slice(0, 5) : `${i}`; // "15:34"
+			let bpm = NaN;
+			if (avgIdx >= 0 && parts[avgIdx] !== undefined) bpm = parseFloat(parts[avgIdx]);
+			else if (parts[1] !== undefined) bpm = parseFloat(parts[1]);
+			if (!Number.isNaN(bpm)) {
+				labels.push(label);
+				data.push(Math.round(bpm));
+			}
+		}
+		return { labels, data };
+	}
+
+	/** Build Obsidian Charts plugin code block for a heart rate line chart (data stays in note). */
+	buildChartsHeartRateBlock(labels: string[], data: number[]): string {
+		if (labels.length === 0 || data.length === 0) return "";
+		const labelsYaml = labels.map((l) => `  - "${l}"`).join("\n");
+		const dataArray = "[" + data.join(", ") + "]";
+		return `## Heart Rate\n\n\`\`\`chart\ntype: line\nlabels:\n${labelsYaml}\nseries:\n  - title: Heart Rate (BPM)\n    fill: true\n    tension: 0.3\n    data: ${dataArray}\n\`\`\`\n`;
+	}
+
+	async ensureRoutesFolder(folder: string = ROUTES_FOLDER): Promise<void> {
+		if (folder && !this.app.vault.getAbstractFileByPath(folder)) {
+			await this.app.vault.createFolder(folder);
+		}
+	}
+
+	/** Save route track data to {routesFolder}/{workoutId}.json for later use. */
+	async saveRouteData(workoutId: string, points: RoutePoint[], routesFolder: string = ROUTES_FOLDER): Promise<void> {
+		await this.ensureRoutesFolder(routesFolder);
+		const path = `${routesFolder}/${workoutId}.json`;
+		const content = JSON.stringify({ workoutId, points }, null, 0);
+		const existing = this.app.vault.getAbstractFileByPath(path);
+		if (existing && "content" in existing) {
+			await this.app.vault.modify(existing as TFile, content);
+		} else {
+			await this.app.vault.create(path, content);
+		}
+	}
+
+	/** Save image data URL to a vault path (e.g. routes/{workoutId}.png). */
+	async saveImageToPath(imageDataUrl: string, vaultPath: string): Promise<void> {
+		let base64Data = imageDataUrl;
+		if (imageDataUrl.startsWith("data:image/")) {
+			const match = imageDataUrl.match(/^data:image\/\w+;base64,(.+)$/);
+			if (match) base64Data = match[1];
+		}
+		const binaryString = atob(base64Data);
+		const bytes = new Uint8Array(binaryString.length);
+		for (let i = 0; i < binaryString.length; i++) bytes[i] = binaryString.charCodeAt(i);
+		const existing = this.app.vault.getAbstractFileByPath(vaultPath);
+		if (existing && "path" in existing) {
+			await this.app.vault.modifyBinary(existing as TFile, bytes.buffer);
+		} else {
+			const pathParts = vaultPath.split("/");
+			for (let i = 1; i < pathParts.length; i++) {
+				const dirPath = pathParts.slice(0, i).join("/");
+				if (!this.app.vault.getAbstractFileByPath(dirPath)) await this.app.vault.createFolder(dirPath);
+			}
+			await this.app.vault.createBinary(vaultPath, bytes.buffer);
+		}
+	}
+
+	/** Build tile URL for current map style (Fiord, Carto Dark, or OSM). Fiord requires MapTiler API key. */
+	private getMapTileUrl(z: number, x: number, y: number): string {
+		const style = this.settings.mapTileStyle ?? "maptiler-fiord";
+		const key = (this.settings.maptilerApiKey ?? "").trim();
+		if (style === "maptiler-fiord" && key) {
+			return `https://api.maptiler.com/tiles/fiord/${z}/${x}/${y}?key=${encodeURIComponent(key)}`;
+		}
+		if (style === "carto-dark" || (style === "maptiler-fiord" && !key)) {
+			return `https://a.basemaps.cartocdn.com/dark_all/${z}/${x}/${y}.png`;
+		}
+		return `https://tile.openstreetmap.org/${z}/${x}/${y}.png`;
+	}
+
+	/** Generate a static map image: 16:9, edge-to-edge tiles + route polyline colored by speed (blue→red). */
+	async generateRouteMapImage(points: RoutePoint[]): Promise<string> {
+		if (typeof document === "undefined" || points.length < 2) return "";
+		const width = 960;
+		const height = 540;
+		const padding = 0;
+		const TILE_SIZE = 256;
+		const minLat = Math.min(...points.map((p) => p.lat));
+		const maxLat = Math.max(...points.map((p) => p.lat));
+		const minLon = Math.min(...points.map((p) => p.lon));
+		const maxLon = Math.max(...points.map((p) => p.lon));
+		const latSpan = maxLat - minLat || 0.0001;
+		const lonSpan = maxLon - minLon || 0.0001;
+		const drawWidth = width - padding * 2;
+		const drawHeight = height - padding * 2;
+
+		// Slippy map: lon/lat to tile-relative pixel at zoom z
+		const latToY = (lat: number, z: number): number => {
+			const latRad = (lat * Math.PI) / 180;
+			const n = Math.pow(2, z);
+			return (1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / Math.PI) / 2 * n * TILE_SIZE;
+		};
+		const lonToX = (lon: number, z: number): number => {
+			const n = Math.pow(2, z);
+			return ((lon + 180) / 360) * n * TILE_SIZE;
+		};
+		// Zoom so route fills the frame (no margin) for readability, then we scale map to fill canvas
+		const midLat = (minLat + maxLat) / 2;
+		const zoomForLon = Math.log2((drawWidth / TILE_SIZE) * (360 / lonSpan));
+		const zoomForLat = Math.log2((drawHeight / TILE_SIZE) * (180 / (latSpan || 0.0001)) * Math.cos((midLat * Math.PI) / 180));
+		const z = Math.max(1, Math.min(19, Math.floor(Math.min(zoomForLon, zoomForLat))));
+		const minTileX = Math.floor(lonToX(minLon, z) / TILE_SIZE);
+		const maxTileX = Math.floor(lonToX(maxLon, z) / TILE_SIZE);
+		const minTileY = Math.floor(latToY(maxLat, z) / TILE_SIZE);
+		const maxTileY = Math.floor(latToY(minLat, z) / TILE_SIZE);
+		const offsetX = padding - minTileX * TILE_SIZE;
+		const offsetY = padding - minTileY * TILE_SIZE;
+		const mapWidth = (maxTileX - minTileX + 1) * TILE_SIZE;
+		const mapHeight = (maxTileY - minTileY + 1) * TILE_SIZE;
+		const scale = Math.max(width / mapWidth, height / mapHeight);
+		const translateX = (width - mapWidth * scale) / 2;
+		const translateY = (height - mapHeight * scale) / 2;
+
+		const speeds = points.map((p) => p.speed).filter((s) => s > 0);
+		const minSpeed = speeds.length ? Math.min(...speeds) : 0;
+		const maxSpeed = speeds.length ? Math.max(...speeds) : 1;
+		const speedRange = maxSpeed - minSpeed || 1;
+		const speedToColor = (s: number): string => {
+			const t = (s - minSpeed) / speedRange;
+			if (t <= 0.33) {
+				const u = t / 0.33;
+				return `rgb(${Math.round(0 + u * 0)}, ${Math.round(0 + u * 128)}, ${Math.round(255 - u * 128)})`;
+			}
+			if (t <= 0.66) {
+				const u = (t - 0.33) / 0.33;
+				return `rgb(${Math.round(0 + u * 255)}, 255, ${Math.round(128 - u * 128)})`;
+			}
+			const u = (t - 0.66) / 0.34;
+			return `rgb(255, ${Math.round(255 - u * 255)}, 0)`;
+		};
+
+		const toX = (lon: number) => offsetX + lonToX(lon, z);
+		const toY = (lat: number) => offsetY + latToY(lat, z);
+
+		const canvas = document.createElement("canvas");
+		canvas.width = width;
+		canvas.height = height;
+		const ctx = canvas.getContext("2d");
+		if (!ctx) return "";
+		ctx.fillStyle = "#1a1a2e";
+		ctx.fillRect(0, 0, width, height);
+
+		// Draw map + route on offscreen canvas at native map size, then scale to fill 16:9 edge-to-edge
+		const offscreen = document.createElement("canvas");
+		offscreen.width = mapWidth;
+		offscreen.height = mapHeight;
+		const offCtx = offscreen.getContext("2d");
+		if (!offCtx) return canvas.toDataURL("image/png");
+		offCtx.fillStyle = "#1a1a2e";
+		offCtx.fillRect(0, 0, mapWidth, mapHeight);
+
+		const tilesToFetch: { x: number; y: number }[] = [];
+		for (let tx = minTileX; tx <= maxTileX; tx++) {
+			for (let ty = minTileY; ty <= maxTileY; ty++) {
+				tilesToFetch.push({ x: tx, y: ty });
+			}
+		}
+		let tilesOk = true;
+		const needsOsmUserAgent = this.getMapTileUrl(z, 0, 0).startsWith("https://tile.openstreetmap.org");
+		await Promise.all(
+			tilesToFetch.map(async (t) => {
+				const url = this.getMapTileUrl(z, t.x, t.y);
+				try {
+					const init: RequestInit = {};
+					if (needsOsmUserAgent) {
+						(init as any).headers = { "User-Agent": "ObsidianWorkoutImporter/1.0 (static map for personal notes)" };
+					}
+					const res = await fetch(url, init);
+					if (!res.ok) {
+						tilesOk = false;
+						return;
+					}
+					const blob = await res.blob();
+					const img = await createImageBitmap(blob);
+					const dx = offsetX + t.x * TILE_SIZE;
+					const dy = offsetY + t.y * TILE_SIZE;
+					offCtx.drawImage(img, dx, dy, TILE_SIZE, TILE_SIZE);
+					img.close();
+				} catch {
+					tilesOk = false;
+				}
+			})
+		);
+		if (!tilesOk) {
+			offCtx.fillStyle = "#1a1a2e";
+			offCtx.fillRect(0, 0, mapWidth, mapHeight);
+		}
+
+		for (let i = 0; i < points.length - 1; i++) {
+			const a = points[i];
+			const b = points[i + 1];
+			const avgSpeed = (a.speed + b.speed) / 2;
+			offCtx.strokeStyle = speedToColor(avgSpeed);
+			offCtx.lineWidth = 4;
+			offCtx.lineCap = "round";
+			offCtx.lineJoin = "round";
+			offCtx.beginPath();
+			offCtx.moveTo(toX(a.lon), toY(a.lat));
+			offCtx.lineTo(toX(b.lon), toY(b.lat));
+			offCtx.stroke();
+		}
+
+		ctx.drawImage(offscreen, 0, 0, mapWidth, mapHeight, translateX, translateY, mapWidth * scale, mapHeight * scale);
+		return canvas.toDataURL("image/png");
+	}
+
+	/** Resolve workout type name to activity icon filename (no extension). Checks map first, then any icon file whose name is a substring of the workout name (or vice versa). */
+	async getIconNameForWorkout(workoutName: string): Promise<string> {
 		const key = (workoutName || "").toLowerCase().trim();
 		if (WORKOUT_TYPE_TO_ICON[key]) return WORKOUT_TYPE_TO_ICON[key];
 		for (const [pattern, icon] of Object.entries(WORKOUT_TYPE_TO_ICON)) {
 			if (key.includes(pattern) || pattern.includes(key)) return icon;
+		}
+		// Match any icon file where the file name (no extension) is contained in the workout name or vice versa
+		const folder = this.app.vault.getAbstractFileByPath(ACTIVITY_ICONS_FOLDER);
+		if (folder && "children" in folder) {
+			const candidates: { base: string; len: number }[] = [];
+			for (const child of (folder as TFolder).children) {
+				if (child instanceof TFile && child.extension === "png") {
+					const base = child.basename.toLowerCase();
+					if (!base) continue;
+					const nameMatches = key.includes(base) || base.includes(key);
+					if (nameMatches) candidates.push({ base: child.basename, len: base.length });
+				}
+			}
+			// Prefer longest match (e.g. "fitbod" over "fit")
+			if (candidates.length) {
+				candidates.sort((a, b) => b.len - a.len);
+				return candidates[0].base;
+			}
 		}
 		return "other";
 	}
@@ -908,7 +1490,7 @@ export default class WorkoutImporterPlugin extends Plugin {
 		const ctx = canvas.getContext("2d");
 		if (!ctx) return "";
 
-		const iconName = this.getIconNameForWorkout(name);
+		const iconName = await this.getIconNameForWorkout(name);
 		const iconUrl = this.getActivityIconUrl(iconName);
 
 		const drawCard = (img: HTMLImageElement | null) => {
@@ -918,8 +1500,16 @@ export default class WorkoutImporterPlugin extends Plugin {
 
 			const padding = 24;
 			const circleR = 32;
-			const circleX = padding + circleR;
 			const circleY = 52;
+			const gap = 16;
+
+			// Center the icon + title group (Obsidian crops from center, so keep content centered)
+			ctx.font = "bold 24px system-ui, -apple-system, sans-serif";
+			const nameWidth = ctx.measureText(name).width;
+			const titleGroupWidth = circleR * 2 + gap + nameWidth;
+			const startX = (width - titleGroupWidth) / 2;
+			const circleX = startX + circleR;
+			const nameX = startX + circleR * 2 + gap;
 
 			// Circular icon background (dark green)
 			ctx.beginPath();
@@ -938,14 +1528,12 @@ export default class WorkoutImporterPlugin extends Plugin {
 				ctx.restore();
 			}
 
-			// Workout name (bold white)
+			// Workout name (bold white), centered with icon
 			ctx.fillStyle = "#ffffff";
-			ctx.font = "bold 24px system-ui, -apple-system, sans-serif";
 			ctx.textBaseline = "middle";
-			const nameX = padding + circleR * 2 + 16;
 			ctx.fillText(name, nameX, circleY);
 
-			// Divider line
+			// Divider line (full width)
 			const dividerY = height - 68;
 			ctx.strokeStyle = "rgba(255,255,255,0.12)";
 			ctx.lineWidth = 1;
@@ -954,28 +1542,34 @@ export default class WorkoutImporterPlugin extends Plugin {
 			ctx.lineTo(width - padding, dividerY);
 			ctx.stroke();
 
-			// Metrics row: Active Calories (left) | Total Time (right)
+			// Metrics row: calories right-aligned in left half, time left-aligned in right half (meet in middle)
 			const metricY = dividerY + 36;
-			const leftX = padding;
-			const rightX = width / 2;
+			const centerX = width / 2;
+			const metricGap = 20;
 
-			// Active Calories
+			// Active Calories (right-aligned, so it meets the center)
+			ctx.textAlign = "right";
 			ctx.fillStyle = "rgba(255,255,255,0.6)";
 			ctx.font = "11px system-ui, sans-serif";
-			ctx.fillText("Active Calories", leftX, metricY - 20);
+			ctx.fillText("Active Calories", centerX - metricGap, metricY - 20);
 			ctx.fillStyle = "#ff375f";
 			ctx.font = "bold 24px system-ui, sans-serif";
-			ctx.fillText(calNum.toString(), leftX, metricY + 2);
+			const calText = calNum.toString();
+			const calWidth = ctx.measureText(calText).width;
+			ctx.fillText(calText, centerX - metricGap, metricY + 2);
 			ctx.font = "14px system-ui, sans-serif";
-			ctx.fillText("CAL", leftX + ctx.measureText(calNum.toString()).width + 6, metricY + 2);
+			ctx.fillText("CAL", centerX - metricGap - calWidth - 8, metricY + 2);
 
-			// Total Time
+			// Total Time (left-aligned from center)
+			ctx.textAlign = "left";
 			ctx.fillStyle = "rgba(255,255,255,0.6)";
 			ctx.font = "11px system-ui, sans-serif";
-			ctx.fillText("Total Time", rightX, metricY - 20);
+			ctx.fillText("Total Time", centerX + metricGap, metricY - 20);
 			ctx.fillStyle = "#ffd60a";
 			ctx.font = "bold 24px system-ui, sans-serif";
-			ctx.fillText(timeStr, rightX, metricY + 2);
+			ctx.fillText(timeStr, centerX + metricGap, metricY + 2);
+
+			ctx.textAlign = "left";
 		};
 
 		if (iconUrl) {
@@ -1186,6 +1780,10 @@ export default class WorkoutImporterPlugin extends Plugin {
 			const wikilink = `[[${relativeImagePath}]]`;
 			lines.push(`banner: ${this.formatYAMLValue(wikilink)}`);
 		}
+		// Workout type as wikilink for globalType (e.g. [[Outdoor Walk]])
+		if (workoutName) {
+			lines.push(`globalType: ${this.formatYAMLValue(`[[${workoutName}]]`)}`);
+		}
 		return lines.join("\n") + "\n";
 	}
 
@@ -1205,8 +1803,9 @@ export default class WorkoutImporterPlugin extends Plugin {
 
 	formatYAMLValue(value: any): string {
 		if (typeof value === "string") {
-			if (value.includes(":") || value.includes('"') || value.includes("'") || value.includes("\n")) {
-				return `"${value.replace(/"/g, '\\"')}"`;
+			// Quote if contains special chars or wikilinks [[...]] so YAML doesn't parse brackets as array
+			if (value.includes("[[") || value.includes(":") || value.includes('"') || value.includes("'") || value.includes("\n")) {
+				return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
 			}
 			return value;
 		}
@@ -1235,7 +1834,7 @@ class WorkoutImporterSettingTab extends PluginSettingTab {
 		containerEl.createEl("h3", { text: "Scan for Imports" });
 		new Setting(containerEl)
 			.setName("Folder to scan")
-			.setDesc("Folder path to scan for JSON (AutoExport) and FITINDEX CSV files. Leave empty to scan the whole vault.")
+			.setDesc("Folder path to scan for JSON (AutoExport), body comp CSV (FITINDEX or RENPHO), and Workouts CSV. Leave empty to scan the whole vault.")
 			.addText((text) => {
 				text.setPlaceholder("e.g. Health Imports or leave empty")
 					.setValue(this.plugin.settings.scanFolderPath ?? "")
@@ -1253,6 +1852,34 @@ class WorkoutImporterSettingTab extends PluginSettingTab {
 					.setValue(this.plugin.settings.deleteSourceAfterImport ?? true)
 					.onChange(async (value) => {
 						this.plugin.settings.deleteSourceAfterImport = value;
+						await this.plugin.saveSettings();
+					});
+			});
+
+		// Route maps (basemap style)
+		containerEl.createEl("h3", { text: "Route maps" });
+		new Setting(containerEl)
+			.setName("Map style")
+			.setDesc("Basemap style for workout route images. Fiord (dark blue) requires a free MapTiler API key.")
+			.addDropdown((drop) => {
+				drop
+					.addOption("maptiler-fiord", "Fiord (dark blue, MapTiler)")
+					.addOption("carto-dark", "Carto Dark (dark, no key)")
+					.addOption("osm", "OpenStreetMap (light)")
+					.setValue(this.plugin.settings.mapTileStyle ?? "maptiler-fiord")
+					.onChange(async (value) => {
+						this.plugin.settings.mapTileStyle = value as "osm" | "carto-dark" | "maptiler-fiord";
+						await this.plugin.saveSettings();
+					});
+			});
+		new Setting(containerEl)
+			.setName("MapTiler API key")
+			.setDesc("Required for Fiord style. Get a free key at cloud.maptiler.com. Leave empty to use Carto Dark when Fiord is selected.")
+			.addText((text) => {
+				text.setPlaceholder("optional")
+					.setValue(this.plugin.settings.maptilerApiKey ?? "")
+					.onChange(async (value) => {
+						this.plugin.settings.maptilerApiKey = value ?? "";
 						await this.plugin.saveSettings();
 					});
 			});
