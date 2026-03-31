@@ -1,9 +1,13 @@
 import { copyFile, mkdir, access } from "fs/promises";
+import { homedir } from "os";
 import { join } from "path";
 
 // Set OBSIDIAN_VAULT to override (e.g. export OBSIDIAN_VAULT="/path/to/vault")
-const DEFAULT_VAULT = "/Users/jimmy/Library/Mobile Documents/iCloud~md~obsidian/Documents/JimmyOS";
-const VAULT_PATH = process.env.OBSIDIAN_VAULT || DEFAULT_VAULT;
+const DEFAULT_VAULT = join(
+	homedir(),
+	"Library/Mobile Documents/iCloud~md~obsidian/Documents/JimmyOS"
+);
+const VAULT_PATH = process.env.OBSIDIAN_VAULT?.trim() || DEFAULT_VAULT;
 const PLUGIN_DIR = join(VAULT_PATH, ".obsidian", "plugins", "workout-importer");
 
 const filesToCopy = ["main.js", "manifest.json", "versions.json"];

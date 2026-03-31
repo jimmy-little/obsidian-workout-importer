@@ -1,5 +1,19 @@
-import { App, Modal, Notice, Plugin, PluginSettingTab, Setting, TFile, TFolder } from "obsidian";
+import { App, Modal, Notice, Plugin, PluginSettingTab, Setting, TAbstractFile, TFile, TFolder } from "obsidian";
 import JSZip from "jszip";
+import {
+	buildScaledItems,
+	formatItemNamesYaml,
+	formatItemsYamlBlock,
+	formatNutritionTableBody,
+	mealNameFromData,
+	micronutrientTotals,
+	parseFoodnomsFromBytes,
+	parseStoredNutritionFrontmatter,
+	resolveMealDate,
+	sanitizeNoteFileComponent,
+	totalsFromScaledItems,
+	type FoodnomsData,
+} from "./foodnoms";
 
 interface KeyMapping {
 	jsonKey: string;
@@ -52,6 +66,13 @@ interface WorkoutImporterSettings {
 	statsNoteBodyTemplatePath: string; // Optional note whose content is used as body below frontmatter for new stats notes
 	mapTileStyle: "osm" | "carto-dark" | "maptiler-fiord"; // Basemap style for route maps
 	maptilerApiKey: string; // Required for MapTiler Fiord style (free key at maptiler.com)
+	/** FoodNoms `.foodnoms` imports */
+	foodnomsEnabled: boolean;
+	foodnomsInboxFolder: string;
+	foodnomsArchiveFolder: string;
+	foodnomsOutputFolder: string;
+	foodnomsDuplicateAction: "ask" | "merge" | "skip" | "overwrite";
+	foodnomsIncludeMicronutrients: boolean;
 }
 
 // --- AutoExport JSON structure (Health AutoExport) ---
@@ -521,10 +542,17 @@ const DEFAULT_SETTINGS: WorkoutImporterSettings = {
 	statsNoteBodyTemplatePath: "",
 	mapTileStyle: "maptiler-fiord",
 	maptilerApiKey: "",
+	foodnomsEnabled: false,
+	foodnomsInboxFolder: "_inbox/foodnoms",
+	foodnomsArchiveFolder: "_archive/foodnoms",
+	foodnomsOutputFolder: "Nutrition",
+	foodnomsDuplicateAction: "ask",
+	foodnomsIncludeMicronutrients: false,
 };
 
 export default class WorkoutImporterPlugin extends Plugin {
 	settings: WorkoutImporterSettings;
+	private foodnomsPollTimer: number | null = null;
 
 	async onload() {
 		await this.loadSettings();
@@ -568,11 +596,29 @@ export default class WorkoutImporterPlugin extends Plugin {
 			},
 		});
 
+		this.addCommand({
+			id: "scan-foodnoms-inbox",
+			name: "Scan FoodNoms inbox",
+			callback: () => {
+				void this.scanFoodnomsInbox();
+			},
+		});
+
+		this.registerEvent(
+			this.app.vault.on("create", (f) => {
+				void this.maybeProcessFoodnomsFile(f);
+			})
+		);
+
+		this.startFoodnomsPolling();
+
 		// This adds a settings tab so the user can configure various aspects of the plugin
 		this.addSettingTab(new WorkoutImporterSettingTab(this.app, this));
 	}
 
-	onunload() {}
+	onunload() {
+		this.stopFoodnomsPolling();
+	}
 
 	async loadSettings() {
 		this.settings = Object.assign(
@@ -584,6 +630,228 @@ export default class WorkoutImporterPlugin extends Plugin {
 
 	async saveSettings() {
 		await this.saveData(this.settings);
+		this.startFoodnomsPolling();
+	}
+
+	/** Normalized inbox path (no leading/trailing slashes). */
+	private foodnomsInboxPath(): string {
+		return (this.settings.foodnomsInboxFolder ?? "").trim().replace(/^\/+|\/+$/g, "");
+	}
+
+	private foodnomsFileInInbox(file: TFile): boolean {
+		if (!this.settings.foodnomsEnabled) return false;
+		const inbox = this.foodnomsInboxPath();
+		if (!inbox) return false;
+		if ((file.extension || "").toLowerCase() !== "foodnoms") return false;
+		return file.path === inbox || file.path.startsWith(inbox + "/");
+	}
+
+	startFoodnomsPolling(): void {
+		this.stopFoodnomsPolling();
+		if (!this.settings.foodnomsEnabled || !this.foodnomsInboxPath()) return;
+		this.foodnomsPollTimer = window.setInterval(() => {
+			void this.scanFoodnomsInbox();
+		}, 60_000);
+		void this.scanFoodnomsInbox();
+	}
+
+	stopFoodnomsPolling(): void {
+		if (this.foodnomsPollTimer != null) {
+			window.clearInterval(this.foodnomsPollTimer);
+			this.foodnomsPollTimer = null;
+		}
+	}
+
+	private async maybeProcessFoodnomsFile(abstract: TAbstractFile): Promise<void> {
+		if (!(abstract instanceof TFile)) return;
+		if (!this.foodnomsFileInInbox(abstract)) return;
+		await this.processFoodnomsFile(abstract);
+	}
+
+	async scanFoodnomsInbox(): Promise<void> {
+		if (!this.settings.foodnomsEnabled) return;
+		const inbox = this.foodnomsInboxPath();
+		if (!inbox) return;
+		const folder = this.app.vault.getAbstractFileByPath(inbox);
+		if (!folder || !("children" in folder)) return;
+		for (const child of (folder as TFolder).children) {
+			if (child instanceof TFile && (child.extension || "").toLowerCase() === "foodnoms") {
+				await this.processFoodnomsFile(child);
+			}
+		}
+	}
+
+	private async ensureParentFoldersForFile(filePath: string): Promise<void> {
+		const parts = filePath.split("/").filter(Boolean);
+		if (parts.length <= 1) return;
+		for (let i = 1; i < parts.length; i++) {
+			const dir = parts.slice(0, i).join("/");
+			if (!this.app.vault.getAbstractFileByPath(dir)) {
+				try {
+					await this.app.vault.createFolder(dir);
+				} catch (e) {
+					if (!String(e).includes("already exists")) throw e;
+				}
+			}
+		}
+	}
+
+	private async processFoodnomsFile(sourceFile: TFile): Promise<void> {
+		if (!this.settings.foodnomsEnabled) return;
+		let buf: ArrayBuffer;
+		try {
+			buf = await this.app.vault.readBinary(sourceFile);
+		} catch (e) {
+			console.error("[Pulse] FoodNoms read failed:", e);
+			new Notice(`FoodNoms: could not read ${sourceFile.path}`);
+			return;
+		}
+		const bytes = new Uint8Array(buf);
+		const data = parseFoodnomsFromBytes(bytes);
+		if (!data) {
+			new Notice(
+				`FoodNoms: could not parse ${sourceFile.name}. Try desktop with optional native lzfse, or ensure export uses uncompressed JSON.`
+			);
+			return;
+		}
+		const stat = sourceFile.stat;
+		const mtime = stat?.mtime ?? Date.now();
+		const meal = mealNameFromData(data);
+		const dateIso = resolveMealDate(data, mtime);
+		const mealFile = sanitizeNoteFileComponent(meal);
+		const outFolder = (this.settings.foodnomsOutputFolder ?? "Nutrition").trim().replace(/^\/+|\/+$/g, "");
+		const notePath = outFolder ? `${outFolder}/${dateIso} ${mealFile}.md` : `${dateIso} ${mealFile}.md`;
+		const existing = this.app.vault.getAbstractFileByPath(notePath);
+		let action = this.settings.foodnomsDuplicateAction ?? "ask";
+		if (existing instanceof TFile && existing.extension === "md") {
+			if (action === "ask") {
+				action = await promptFoodnomsDuplicate(this.app, notePath);
+			}
+			if (action === "skip") {
+				return;
+			}
+		} else {
+			action = "overwrite";
+		}
+		let existingRaw: string | null = null;
+		if (existing instanceof TFile && action === "merge") {
+			try {
+				existingRaw = await this.app.vault.read(existing);
+			} catch {
+				existingRaw = null;
+			}
+		}
+		let markdown: string;
+		try {
+			markdown = this.buildFoodnomsNoteContent(
+				data,
+				sourceFile.name,
+				mtime,
+				action,
+				existingRaw
+			);
+		} catch (e) {
+			console.error("[Pulse] FoodNoms build note failed:", e);
+			new Notice(`FoodNoms: ${e instanceof Error ? e.message : String(e)}`);
+			return;
+		}
+		await this.ensureParentFoldersForFile(notePath);
+		if (existing instanceof TFile) {
+			await this.app.vault.modify(existing, markdown);
+		} else {
+			try {
+				await this.app.vault.create(notePath, markdown);
+			} catch (e) {
+				if (String(e).includes("already exists")) {
+					const f = this.app.vault.getAbstractFileByPath(notePath);
+					if (f instanceof TFile) await this.app.vault.modify(f, markdown);
+					else throw e;
+				} else throw e;
+			}
+		}
+		const { items, totals } = buildScaledItems(data);
+		const cal = Math.round(totals.calories ?? 0);
+		const prot = Math.round(totals.protein ?? 0);
+		new Notice(`Imported ${meal} (${cal} cal, ${prot}g protein)`);
+		await this.archiveFoodnomsSource(sourceFile, dateIso);
+	}
+
+	private buildFoodnomsNoteContent(
+		data: FoodnomsData,
+		sourceFileName: string,
+		fileMtimeMs: number,
+		action: "ask" | "merge" | "skip" | "overwrite",
+		existingNoteContent: string | null
+	): string {
+		const meal = mealNameFromData(data);
+		const dateIso = resolveMealDate(data, fileMtimeMs);
+		let { items, totals } = buildScaledItems(data);
+		if (action === "merge" && existingNoteContent) {
+			const fmMatch = existingNoteContent.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+			if (fmMatch) {
+				const { items: oldItems } = parseStoredNutritionFrontmatter(fmMatch[1]);
+				if (oldItems.length > 0) {
+					items = [...oldItems, ...items];
+					totals = totalsFromScaledItems(items);
+				}
+			}
+		}
+		const names = items.map((i) => i.name);
+		// Merged notes only carry macros from item rows; full micronutrient re-aggregation is not implemented.
+		const includeMicro =
+			(this.settings.foodnomsIncludeMicronutrients ?? false) && action !== "merge";
+		const micro = micronutrientTotals(totals, includeMicro);
+		const sugarRaw = totals.sugars ?? (totals as Record<string, number>).sugar;
+		const sugarVal = Math.round((sugarRaw ?? 0) * 10) / 10;
+		const fiberVal = Math.round((totals.fiber ?? 0) * 10) / 10;
+		const sodiumVal = Math.round((totals.sodium ?? 0) * 10) / 10;
+		const lines: string[] = ["---"];
+		lines.push(`date: ${dateIso}`);
+		lines.push(`meal: ${this.formatYAMLValue(meal)}`);
+		lines.push("type: nutrition");
+		lines.push(`calories: ${Math.round(totals.calories ?? 0)}`);
+		lines.push(`protein: ${Math.round(totals.protein ?? 0)}`);
+		lines.push(`carbs: ${Math.round(totals.carbs ?? 0)}`);
+		lines.push(`fat: ${Math.round(totals.fat ?? 0)}`);
+		lines.push(`fiber: ${fiberVal}`);
+		lines.push(`sodium: ${sodiumVal}`);
+		lines.push(`sugar: ${sugarVal}`);
+		lines.push(formatItemsYamlBlock(items).trimEnd());
+		lines.push(formatItemNamesYaml(names).trimEnd());
+		lines.push(`imported_from: ${this.formatYAMLValue(sourceFileName)}`);
+		lines.push(`imported_at: ${new Date().toISOString()}`);
+		lines.push("source: foodnoms");
+		for (const [k, v] of Object.entries(micro)) {
+			lines.push(`${k}: ${v}`);
+		}
+		lines.push("---");
+		const body = formatNutritionTableBody(meal, dateIso, items, totals);
+		return lines.join("\n") + "\n\n" + body;
+	}
+
+	private async archiveFoodnomsSource(sourceFile: TFile, dateIso: string): Promise<void> {
+		const root = (this.settings.foodnomsArchiveFolder ?? "_archive/foodnoms").trim().replace(/^\/+|\/+$/g, "");
+		const ym = dateIso.slice(0, 7);
+		const destFolder = root ? `${root}/${ym}` : ym;
+		const destPath = `${destFolder}/${sourceFile.name}`;
+		try {
+			await this.ensureParentFoldersForFile(destPath);
+			if (this.app.vault.getAbstractFileByPath(destPath)) {
+				const base = sourceFile.basename.replace(/\.foodnoms$/i, "");
+				let n = 2;
+				let alt = `${destFolder}/${base} (${n}).foodnoms`;
+				while (this.app.vault.getAbstractFileByPath(alt)) {
+					n++;
+					alt = `${destFolder}/${base} (${n}).foodnoms`;
+				}
+				await this.app.fileManager.renameFile(sourceFile, alt);
+			} else {
+				await this.app.fileManager.renameFile(sourceFile, destPath);
+			}
+		} catch (e) {
+			console.error("[Pulse] FoodNoms archive failed:", e);
+			new Notice(`FoodNoms: imported but could not archive ${sourceFile.name}.`);
+		}
 	}
 
 	/** Decompress a ZIP in the vault into baseFolder/{zipBasename}/. Extracts only text files (csv, json, gpx, xml, txt, md). */
@@ -1958,6 +2226,39 @@ function parseHaeJson(jsonText: string): HaeWorkoutData | null {
 	}
 }
 
+function promptFoodnomsDuplicate(app: App, targetPath: string): Promise<"overwrite" | "merge" | "skip"> {
+	return new Promise((resolve) => {
+		let settled = false;
+		const finish = (v: "overwrite" | "merge" | "skip") => {
+			if (settled) return;
+			settled = true;
+			resolve(v);
+		};
+		const modal = new Modal(app);
+		modal.titleEl.setText("Nutrition note already exists");
+		modal.contentEl.createEl("p", {
+			text: `A note already exists at:\n${targetPath}`,
+		});
+		const row = modal.contentEl.createDiv();
+		row.style.display = "flex";
+		row.style.flexWrap = "wrap";
+		row.style.gap = "8px";
+		row.style.marginTop = "12px";
+		const mk = (label: string, v: "overwrite" | "merge" | "skip") => {
+			const b = row.createEl("button", { text: label });
+			b.addEventListener("click", () => {
+				modal.close();
+				finish(v);
+			});
+		};
+		mk("Overwrite", "overwrite");
+		mk("Merge items", "merge");
+		mk("Skip", "skip");
+		modal.onClose = () => finish("skip");
+		modal.open();
+	});
+}
+
 class WorkoutImporterSettingTab extends PluginSettingTab {
 	plugin: WorkoutImporterPlugin;
 
@@ -2022,6 +2323,79 @@ class WorkoutImporterSettingTab extends PluginSettingTab {
 					.setValue(this.plugin.settings.maptilerApiKey ?? "")
 					.onChange(async (value) => {
 						this.plugin.settings.maptilerApiKey = value ?? "";
+						await this.plugin.saveSettings();
+					});
+			});
+
+		containerEl.createEl("h3", { text: "FoodNoms import" });
+		new Setting(containerEl)
+			.setName("Enable FoodNoms import")
+			.setDesc(
+				"Watch the inbox folder for .foodnoms files (FoodNoms app → Share → Files). Uncompressed LZFSE JSON (bvx-) works everywhere; full LZFSE needs optional native lzfse on desktop."
+			)
+			.addToggle((toggle) => {
+				toggle
+					.setValue(this.plugin.settings.foodnomsEnabled ?? false)
+					.onChange(async (value) => {
+						this.plugin.settings.foodnomsEnabled = value;
+						await this.plugin.saveSettings();
+					});
+			});
+		new Setting(containerEl)
+			.setName("Inbox folder")
+			.setDesc("Drop .foodnoms exports here (vault path).")
+			.addText((text) => {
+				text.setPlaceholder("_inbox/foodnoms")
+					.setValue(this.plugin.settings.foodnomsInboxFolder ?? "")
+					.onChange(async (value) => {
+						this.plugin.settings.foodnomsInboxFolder = (value ?? "").trim();
+						await this.plugin.saveSettings();
+					});
+			});
+		new Setting(containerEl)
+			.setName("Archive folder")
+			.setDesc("After import, files are moved under YYYY-MM here.")
+			.addText((text) => {
+				text.setPlaceholder("_archive/foodnoms")
+					.setValue(this.plugin.settings.foodnomsArchiveFolder ?? "")
+					.onChange(async (value) => {
+						this.plugin.settings.foodnomsArchiveFolder = (value ?? "").trim();
+						await this.plugin.saveSettings();
+					});
+			});
+		new Setting(containerEl)
+			.setName("Nutrition notes folder")
+			.setDesc("Created notes: {date} {meal}.md")
+			.addText((text) => {
+				text.setPlaceholder("Nutrition")
+					.setValue(this.plugin.settings.foodnomsOutputFolder ?? "")
+					.onChange(async (value) => {
+						this.plugin.settings.foodnomsOutputFolder = (value ?? "").trim();
+						await this.plugin.saveSettings();
+					});
+			});
+		new Setting(containerEl)
+			.setName("When note already exists")
+			.addDropdown((drop) => {
+				drop
+					.addOption("ask", "Ask (Overwrite / Merge / Skip)")
+					.addOption("merge", "Merge items")
+					.addOption("skip", "Skip")
+					.addOption("overwrite", "Overwrite")
+					.setValue(this.plugin.settings.foodnomsDuplicateAction ?? "ask")
+					.onChange(async (value) => {
+						this.plugin.settings.foodnomsDuplicateAction = value as "ask" | "merge" | "skip" | "overwrite";
+						await this.plugin.saveSettings();
+					});
+			});
+		new Setting(containerEl)
+			.setName("Include micronutrients in frontmatter")
+			.setDesc("Meal-level totals only (extra USDA fields). Off by default.")
+			.addToggle((toggle) => {
+				toggle
+					.setValue(this.plugin.settings.foodnomsIncludeMicronutrients ?? false)
+					.onChange(async (value) => {
+						this.plugin.settings.foodnomsIncludeMicronutrients = value;
 						await this.plugin.saveSettings();
 					});
 			});
