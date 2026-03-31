@@ -17,6 +17,29 @@ interface AdditionalFrontMatter {
 	value: string;
 }
 
+/** Parsed payload inside Health Auto Export `.hae` files (Core Data timestamps = seconds since 2001-01-01). */
+interface HaeWorkoutData {
+	id?: string;
+	name: string;
+	start: number;
+	end?: number;
+	duration?: number;
+	location?: string;
+	activeEnergy?: number;
+	totalDistance?: number;
+	METs?: number;
+	temperature?: number;
+	humidity?: number;
+	avgHeartRate?: number;
+	maxHeartRate?: number;
+	minHeartRate?: number;
+	stepCount?: number;
+	elevationAscended?: number;
+	elevationDescended?: number;
+	flightsClimbed?: number;
+	[key: string]: unknown;
+}
+
 interface WorkoutImporterSettings {
 	keyMappings: KeyMapping[];
 	templates: WorkoutTemplate[];
@@ -364,7 +387,9 @@ export function getStatsNotePath(date: Date, pathTemplate: string): string {
 }
 
 /** Generate a stable UUID from workout identity (name + start). Same workout always gets same id. */
-export function workoutIdFromWorkout(workout: { name?: string; start?: string }): string {
+export function workoutIdFromWorkout(workout: { id?: string; name?: string; start?: string }): string {
+	const explicit = (workout?.id ?? "").toString().trim();
+	if (explicit) return explicit;
 	const name = (workout?.name ?? "").trim() || "Unknown";
 	const start = (workout?.start ?? "").toString().trim().slice(0, 19);
 	const key = `${name}|${start}`;
@@ -516,7 +541,7 @@ export default class WorkoutImporterPlugin extends Plugin {
 
 		this.addCommand({
 			id: "scan-health-workout-imports",
-			name: "Scan for Health and Workout Imports",
+			name: "Scan workout folder",
 			callback: () => {
 				this.scanAndImport();
 			},
@@ -527,6 +552,19 @@ export default class WorkoutImporterPlugin extends Plugin {
 			name: "Update banner for this page",
 			callback: () => {
 				this.updateBannerForActiveNote();
+			},
+		});
+
+		this.addCommand({
+			id: "recreate-banner",
+			name: "Recreate Banner",
+			checkCallback: (checking: boolean) => {
+				const activeFile = this.app.workspace.getActiveFile();
+				if (activeFile && activeFile.extension === "md") {
+					if (!checking) void this.updateBannerForActiveNote();
+					return true;
+				}
+				return false;
 			},
 		});
 
@@ -603,6 +641,7 @@ export default class WorkoutImporterPlugin extends Plugin {
 			if (!inScope(f)) return false;
 			const ext = (f.extension || "").toLowerCase();
 			if (ext === "json") return true;
+			if (ext === "hae") return true;
 			if (ext === "csv" && isFITINDEXCsvFileName(f.name)) return true;
 			if (ext === "csv" && isRENPHOCsvFileName(f.name)) return true;
 			if (ext === "csv" && isHealthAutoExportWorkoutsCsv(f.name)) return true;
@@ -611,8 +650,8 @@ export default class WorkoutImporterPlugin extends Plugin {
 		if (toProcess.length === 0) {
 			new Notice(
 				folder
-					? `No JSON, FITINDEX/RENPHO CSV, or Workouts CSV found in ${folder}`
-					: "No JSON, FITINDEX/RENPHO CSV, or Workouts CSV found in vault"
+					? `No JSON, .hae, FITINDEX/RENPHO CSV, or Workouts CSV found in ${folder}`
+					: "No JSON, .hae, FITINDEX/RENPHO CSV, or Workouts CSV found in vault"
 			);
 			return;
 		}
@@ -629,14 +668,66 @@ export default class WorkoutImporterPlugin extends Plugin {
 		}
 	}
 
+	/** Convert Health Auto Export `.hae` JSON payload to the shape expected by `processWorkout`. */
+	private createWorkoutFromHaeData(haeData: HaeWorkoutData): Record<string, unknown> | null {
+		if (!haeData.name || haeData.start == null || !Number.isFinite(Number(haeData.start))) {
+			return null;
+		}
+		const CORE_DATA_EPOCH_MS = 978307200000;
+		const startSec = Number(haeData.start);
+		const startDate = new Date(CORE_DATA_EPOCH_MS + startSec * 1000);
+		const endDate =
+			haeData.end != null && Number.isFinite(Number(haeData.end))
+				? new Date(CORE_DATA_EPOCH_MS + Number(haeData.end) * 1000)
+				: new Date(startDate.getTime() + (Number(haeData.duration) || 0) * 1000);
+		const workout: Record<string, unknown> = {
+			id: haeData.id,
+			name: haeData.name,
+			start: startDate.toISOString(),
+			end: endDate.toISOString(),
+			duration: haeData.duration ?? 0,
+			metadata: { source: "hae" },
+			location: haeData.location,
+		};
+		if (haeData.activeEnergy != null) workout.activeEnergyBurned = { qty: haeData.activeEnergy, units: "kcal" };
+		if (haeData.totalDistance != null) workout.distance = { qty: haeData.totalDistance, units: "mi" };
+		if (haeData.METs != null) workout.intensity = { qty: haeData.METs, units: "METs" };
+		if (haeData.temperature != null) workout.temperature = haeData.temperature;
+		if (haeData.humidity != null) workout.humidity = haeData.humidity;
+		if (haeData.avgHeartRate != null) workout.avgHeartRate = haeData.avgHeartRate;
+		if (haeData.maxHeartRate != null) workout.maxHeartRate = haeData.maxHeartRate;
+		if (haeData.minHeartRate != null) workout.minHeartRate = haeData.minHeartRate;
+		if (haeData.stepCount != null) workout.stepCount = haeData.stepCount;
+		if (haeData.elevationAscended != null) workout.elevationAscended = haeData.elevationAscended;
+		if (haeData.elevationDescended != null) workout.elevationDescended = haeData.elevationDescended;
+		if (haeData.flightsClimbed != null) workout.flightsClimbed = haeData.flightsClimbed;
+		return workout;
+	}
+
 	async processVaultFiles(files: TFile[]): Promise<{ success: number; errors: number }> {
 		let success = 0;
 		let errors = 0;
 		for (const file of files) {
 			let processed = false;
 			try {
-				const text = await this.app.vault.read(file);
 				const ext = (file.extension || "").toLowerCase();
+				if (ext === "hae") {
+					const buf = await this.app.vault.readBinary(file);
+					const bytes = new Uint8Array(buf);
+					const haeData = parseHaeFile(bytes);
+					const workout = haeData ? this.createWorkoutFromHaeData(haeData) : null;
+					if (workout) {
+						await this.processWorkout(workout);
+						success++;
+						processed = true;
+					} else if (haeData) {
+						errors++;
+					} else {
+						console.warn(`[Pulse] Skipping unreadable .hae: ${file.path}`);
+						errors++;
+					}
+				} else {
+				const text = await this.app.vault.read(file);
 				if (ext === "json") {
 					let parsed: AutoExportParsed;
 					try {
@@ -675,6 +766,7 @@ export default class WorkoutImporterPlugin extends Plugin {
 						}
 					}
 					processed = workouts.length > 0;
+				}
 				}
 				if (processed && this.settings.deleteSourceAfterImport) {
 					await this.app.vault.trash(file, false);
@@ -1816,6 +1908,56 @@ export default class WorkoutImporterPlugin extends Plugin {
 	}
 }
 
+const HAE_TEXT_DECODER = new TextDecoder();
+
+/** Health Auto Export `.hae`: LZFSE-style wrapper; common case is uncompressed `bvx-` block with raw JSON. */
+function parseHaeFile(bytes: Uint8Array): HaeWorkoutData | null {
+	if (bytes.length < 12) return null;
+	const magic = String.fromCharCode(bytes[0], bytes[1], bytes[2], bytes[3]);
+	if (magic === "bvx-") {
+		const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+		const uncompressedSize = view.getUint32(4, true);
+		const jsonStart = 8;
+		const jsonEnd = jsonStart + uncompressedSize;
+		if (jsonEnd <= bytes.length) {
+			const jsonBytes = bytes.subarray(jsonStart, jsonEnd);
+			return parseHaeJson(HAE_TEXT_DECODER.decode(jsonBytes));
+		}
+		const endMarker = findBvxEndMarker(bytes);
+		if (endMarker === -1) return null;
+		return parseHaeJson(HAE_TEXT_DECODER.decode(bytes.subarray(jsonStart, endMarker)));
+	}
+	if (magic === "bvxn" || magic === "bvx1" || magic === "bvx2") {
+		console.warn("[Pulse] .hae uses compressed LZFSE (", magic, "); export as JSON/CSV or decompress externally.");
+		return null;
+	}
+	try {
+		return parseHaeJson(HAE_TEXT_DECODER.decode(bytes));
+	} catch {
+		return null;
+	}
+}
+
+function findBvxEndMarker(bytes: Uint8Array): number {
+	for (let i = bytes.length - 4; i >= 8; i--) {
+		if (bytes[i] === 0x62 && bytes[i + 1] === 0x76 && bytes[i + 2] === 0x78 && bytes[i + 3] === 0x24) {
+			return i;
+		}
+	}
+	return -1;
+}
+
+function parseHaeJson(jsonText: string): HaeWorkoutData | null {
+	try {
+		const data = JSON.parse(jsonText) as HaeWorkoutData;
+		if (!data.name || data.start == null) return null;
+		return data;
+	} catch (e) {
+		console.error("[Pulse] Failed to parse .hae JSON:", e);
+		return null;
+	}
+}
+
 class WorkoutImporterSettingTab extends PluginSettingTab {
 	plugin: WorkoutImporterPlugin;
 
@@ -1830,11 +1972,11 @@ class WorkoutImporterSettingTab extends PluginSettingTab {
 		containerEl.empty();
 		containerEl.createEl("h2", { text: "Pulse Settings" });
 
-		// Scan folder (for "Scan for Health and Workout Imports" command)
+		// Scan folder (for "Scan workout folder" command)
 		containerEl.createEl("h3", { text: "Scan for Imports" });
 		new Setting(containerEl)
 			.setName("Folder to scan")
-			.setDesc("Folder path to scan for JSON (AutoExport), body comp CSV (FITINDEX or RENPHO), and Workouts CSV. Leave empty to scan the whole vault.")
+			.setDesc("Folder path to scan for JSON (AutoExport), .hae workout files, body comp CSV (FITINDEX or RENPHO), and Workouts CSV. Leave empty to scan the whole vault.")
 			.addText((text) => {
 				text.setPlaceholder("e.g. Health Imports or leave empty")
 					.setValue(this.plugin.settings.scanFolderPath ?? "")
