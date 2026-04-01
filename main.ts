@@ -9,7 +9,9 @@ import {
 	micronutrientTotals,
 	parseFoodnomsFromBytes,
 	parseStoredNutritionFrontmatter,
+	mealDateForPathExpansion,
 	resolveMealDate,
+	resolveMealTime24h,
 	sanitizeNoteFileComponent,
 	totalsFromScaledItems,
 	type FoodnomsData,
@@ -523,6 +525,35 @@ export function stringifyFrontmatter(fm: Record<string, string | number>): strin
 	return lines.join("\n") + "\n";
 }
 
+/**
+ * Expand `{YYYY}`, `{MM}`, `{DD}`, `{YYYYMMDD}`, `{YYYY-MM-DD}`, `{YYYYMMDD-HHMM}`, `{YYYY-MM-DD-HHMM}`,
+ * `{HH}`, `{mm}` (minutes), `{name}` in folder/file path templates. Longest tokens first. Trims slashes.
+ */
+function expandMomentPathTemplate(template: string, refDate: Date, name?: string): string {
+	const year = refDate.getFullYear().toString();
+	const month = (refDate.getMonth() + 1).toString().padStart(2, "0");
+	const day = refDate.getDate().toString().padStart(2, "0");
+	const hours = refDate.getHours().toString().padStart(2, "0");
+	const minutes = refDate.getMinutes().toString().padStart(2, "0");
+	const dateHyphen = `${year}-${month}-${day}`;
+	const dateCompact = `${year}${month}${day}`;
+	const dateTimeStr = `${year}${month}${day}-${hours}${minutes}`;
+	const dateTimeStrHyphenated = `${year}-${month}-${day}-${hours}${minutes}`;
+	const sanitizedName = (name ?? "").replace(/[<>:"/\\|?*]/g, "-").trim() || "Meal";
+	let s = template.trim();
+	s = s.replace(/{YYYYMMDD-HHMM}/gi, dateTimeStr);
+	s = s.replace(/{YYYY-MM-DD-HHMM}/gi, dateTimeStrHyphenated);
+	s = s.replace(/{YYYY-MM-DD}/gi, dateHyphen);
+	s = s.replace(/{YYYYMMDD}/gi, dateCompact);
+	s = s.replace(/{YYYY}/gi, year);
+	s = s.replace(/{MM}/g, month);
+	s = s.replace(/{DD}/gi, day);
+	s = s.replace(/{HH}/gi, hours);
+	s = s.replace(/{mm}/g, minutes);
+	s = s.replace(/{name}/gi, sanitizedName);
+	return s.replace(/^\/+|\/+$/g, "");
+}
+
 const DEFAULT_SETTINGS: WorkoutImporterSettings = {
 	keyMappings: [
 		{ jsonKey: "name", yamlKey: "name" },
@@ -544,7 +575,7 @@ const DEFAULT_SETTINGS: WorkoutImporterSettings = {
 	maptilerApiKey: "",
 	foodnomsEnabled: false,
 	foodnomsInboxFolder: "_inbox/foodnoms",
-	foodnomsArchiveFolder: "_archive/foodnoms",
+	foodnomsArchiveFolder: "_archive/foodnoms/{YYYY}/{MM}",
 	foodnomsOutputFolder: "Nutrition",
 	foodnomsDuplicateAction: "ask",
 	foodnomsIncludeMicronutrients: false,
@@ -710,7 +741,7 @@ export default class WorkoutImporterPlugin extends Plugin {
 		const data = parseFoodnomsFromBytes(bytes);
 		if (!data) {
 			new Notice(
-				`FoodNoms: could not parse ${sourceFile.name}. Try desktop with optional native lzfse, or ensure export uses uncompressed JSON.`
+				`FoodNoms: could not parse ${sourceFile.name}. On Mac, install Apple's lzfse tool: brew install lzfse (then reload Obsidian). Or use an export that is uncompressed JSON.`
 			);
 			return;
 		}
@@ -719,7 +750,9 @@ export default class WorkoutImporterPlugin extends Plugin {
 		const meal = mealNameFromData(data);
 		const dateIso = resolveMealDate(data, mtime);
 		const mealFile = sanitizeNoteFileComponent(meal);
-		const outFolder = (this.settings.foodnomsOutputFolder ?? "Nutrition").trim().replace(/^\/+|\/+$/g, "");
+		const pathDate = mealDateForPathExpansion(dateIso, data);
+		const folderTemplate = (this.settings.foodnomsOutputFolder ?? "Nutrition").trim();
+		const outFolder = expandMomentPathTemplate(folderTemplate, pathDate, meal);
 		const notePath = outFolder ? `${outFolder}/${dateIso} ${mealFile}.md` : `${dateIso} ${mealFile}.md`;
 		const existing = this.app.vault.getAbstractFileByPath(notePath);
 		let action = this.settings.foodnomsDuplicateAction ?? "ask";
@@ -773,7 +806,7 @@ export default class WorkoutImporterPlugin extends Plugin {
 		const cal = Math.round(totals.calories ?? 0);
 		const prot = Math.round(totals.protein ?? 0);
 		new Notice(`Imported ${meal} (${cal} cal, ${prot}g protein)`);
-		await this.archiveFoodnomsSource(sourceFile, dateIso);
+		await this.archiveFoodnomsSource(sourceFile, pathDate, meal);
 	}
 
 	private buildFoodnomsNoteContent(
@@ -807,8 +840,14 @@ export default class WorkoutImporterPlugin extends Plugin {
 		const sodiumVal = Math.round((totals.sodium ?? 0) * 10) / 10;
 		const lines: string[] = ["---"];
 		lines.push(`date: ${dateIso}`);
+		const time24 = resolveMealTime24h(data);
+		if (time24) {
+			lines.push(`time: ${time24}`);
+		}
 		lines.push(`meal: ${this.formatYAMLValue(meal)}`);
 		lines.push("type: nutrition");
+		lines.push("project:");
+		lines.push(`  - "[[Health & Fitness]]"`);
 		lines.push(`calories: ${Math.round(totals.calories ?? 0)}`);
 		lines.push(`protein: ${Math.round(totals.protein ?? 0)}`);
 		lines.push(`carbs: ${Math.round(totals.carbs ?? 0)}`);
@@ -829,10 +868,9 @@ export default class WorkoutImporterPlugin extends Plugin {
 		return lines.join("\n") + "\n\n" + body;
 	}
 
-	private async archiveFoodnomsSource(sourceFile: TFile, dateIso: string): Promise<void> {
-		const root = (this.settings.foodnomsArchiveFolder ?? "_archive/foodnoms").trim().replace(/^\/+|\/+$/g, "");
-		const ym = dateIso.slice(0, 7);
-		const destFolder = root ? `${root}/${ym}` : ym;
+	private async archiveFoodnomsSource(sourceFile: TFile, refDate: Date, mealName: string): Promise<void> {
+		const archiveTemplate = (this.settings.foodnomsArchiveFolder ?? "_archive/foodnoms/{YYYY}/{MM}").trim();
+		const destFolder = expandMomentPathTemplate(archiveTemplate, refDate, mealName);
 		const destPath = `${destFolder}/${sourceFile.name}`;
 		try {
 			await this.ensureParentFoldersForFile(destPath);
@@ -1468,20 +1506,7 @@ export default class WorkoutImporterPlugin extends Plugin {
 
 	generateFilePath(workoutName: string, workoutDate: Date): string {
 		const template = this.settings.saveDestination || "{YYYY}/{MM}/{YYYYMMDD-HHMM}-{name}.md";
-		const year = workoutDate.getFullYear().toString();
-		const month = (workoutDate.getMonth() + 1).toString().padStart(2, "0");
-		const day = workoutDate.getDate().toString().padStart(2, "0");
-		const hours = workoutDate.getHours().toString().padStart(2, "0");
-		const minutes = workoutDate.getMinutes().toString().padStart(2, "0");
-		const dateTimeStr = `${year}${month}${day}-${hours}${minutes}`;
-		const dateTimeStrHyphenated = `${year}-${month}-${day}-${hours}${minutes}`;
-		const sanitizedName = workoutName.replace(/[<>:"/\\|?*]/g, "-");
-		let filePath = template
-			.replace(/{YYYY}/g, year)
-			.replace(/{MM}/g, month)
-			.replace(/{YYYYMMDD-HHMM}/g, dateTimeStr)
-			.replace(/{YYYY-MM-DD-HHMM}/g, dateTimeStrHyphenated)
-			.replace(/{name}/g, sanitizedName);
+		let filePath = expandMomentPathTemplate(template, workoutDate, workoutName);
 		if (!filePath.endsWith(".md")) filePath += ".md";
 		return filePath;
 	}
@@ -2354,9 +2379,11 @@ class WorkoutImporterSettingTab extends PluginSettingTab {
 			});
 		new Setting(containerEl)
 			.setName("Archive folder")
-			.setDesc("After import, files are moved under YYYY-MM here.")
+			.setDesc(
+				"After import, the .foodnoms file is moved here. Variables: {YYYY}, {MM}, {DD}, {YYYYMMDD}, {YYYY-MM-DD}, {HH}, {mm}, {name}."
+			)
 			.addText((text) => {
-				text.setPlaceholder("_archive/foodnoms")
+				text.setPlaceholder("_archive/foodnoms/{YYYY}/{MM}")
 					.setValue(this.plugin.settings.foodnomsArchiveFolder ?? "")
 					.onChange(async (value) => {
 						this.plugin.settings.foodnomsArchiveFolder = (value ?? "").trim();
@@ -2365,9 +2392,11 @@ class WorkoutImporterSettingTab extends PluginSettingTab {
 			});
 		new Setting(containerEl)
 			.setName("Nutrition notes folder")
-			.setDesc("Created notes: {date} {meal}.md")
+			.setDesc(
+				"Folder for notes (file name is always YYYY-MM-DD {meal}.md). Variables: {YYYY}, {MM}, {DD}, {YYYYMMDD}, {YYYY-MM-DD}, {YYYYMMDD-HHMM}, {YYYY-MM-DD-HHMM}, {HH}, {mm}, {name}."
+			)
 			.addText((text) => {
-				text.setPlaceholder("Nutrition")
+				text.setPlaceholder("60 Logs/{YYYY}/Food/{MM}")
 					.setValue(this.plugin.settings.foodnomsOutputFolder ?? "")
 					.onChange(async (value) => {
 						this.plugin.settings.foodnomsOutputFolder = (value ?? "").trim();

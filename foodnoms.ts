@@ -13,6 +13,8 @@ export interface FoodnomsData {
 	date?: string;
 	loggedAt?: string;
 	createdAt?: string;
+	/** Clock time from export when present (e.g. "14:30") */
+	time?: string;
 	[key: string]: unknown;
 }
 
@@ -107,11 +109,178 @@ export function tryDecompressLzfseNode(bytes: Uint8Array): string | null {
 	}
 }
 
+const LZFSE_CLI_CANDIDATES = ["lzfse", "/opt/homebrew/bin/lzfse", "/usr/local/bin/lzfse"];
+
+/**
+ * Decompress full-file LZFSE using Apple's `lzfse` CLI (e.g. `brew install lzfse`).
+ * Works in Obsidian desktop where Node `fs` / `child_process` are available.
+ */
+export function tryDecompressLzfseCli(bytes: Uint8Array): string | null {
+	try {
+		// eslint-disable-next-line @typescript-eslint/no-var-requires
+		const { execFileSync } = require("child_process") as typeof import("child_process");
+		// eslint-disable-next-line @typescript-eslint/no-var-requires
+		const fs = require("fs") as typeof import("fs");
+		// eslint-disable-next-line @typescript-eslint/no-var-requires
+		const path = require("path") as typeof import("path");
+		// eslint-disable-next-line @typescript-eslint/no-var-requires
+		const os = require("os") as typeof import("os");
+		const B = globalThis.Buffer as typeof import("buffer").Buffer | undefined;
+		if (!B) return null;
+		const id = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+		const inPath = path.join(os.tmpdir(), `foodnoms-${id}.lzfse`);
+		const outPath = path.join(os.tmpdir(), `foodnoms-${id}.out`);
+		fs.writeFileSync(inPath, B.from(bytes));
+		try {
+			let decoded = false;
+			for (const bin of LZFSE_CLI_CANDIDATES) {
+				try {
+					execFileSync(bin, ["-decode", "-i", inPath, "-o", outPath], {
+						stdio: "ignore",
+						encoding: "utf8",
+					});
+					decoded = true;
+					break;
+				} catch {
+					// try next binary path
+				}
+			}
+			if (!decoded) return null;
+			const out = fs.readFileSync(outPath, "utf8");
+			return out.replace(/^\uFEFF/, "");
+		} finally {
+			try {
+				fs.unlinkSync(inPath);
+			} catch {
+				/* ignore */
+			}
+			try {
+				fs.unlinkSync(outPath);
+			} catch {
+				/* ignore */
+			}
+		}
+	} catch {
+		return null;
+	}
+}
+
+function asRecord(v: unknown): Record<string, unknown> | null {
+	return v !== null && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : null;
+}
+
+/** Map real FoodNoms / export variants into `FoodnomsData`. */
+export function normalizeFoodnomsPayload(raw: unknown): FoodnomsData | null {
+	let root = asRecord(raw);
+	if (!root) return null;
+	// Some exports wrap payload in `data` or `payload`
+	const inner = asRecord(root.data) ?? asRecord(root.payload);
+	if (inner && (inner.foodEntries ?? inner.food_entries ?? inner.entries)) {
+		root = inner;
+	}
+	const entriesRaw =
+		root.foodEntries ??
+		root.food_entries ??
+		root.entries ??
+		root.FoodEntries;
+	if (!Array.isArray(entriesRaw) || entriesRaw.length === 0) return null;
+
+	const foodEntries: FoodEntry[] = [];
+	for (const item of entriesRaw) {
+		const o = asRecord(item);
+		if (!o) continue;
+		const name = String(o.name ?? "").trim();
+		if (!name) continue;
+		const foodID = String(o.foodID ?? o.foodId ?? o.food_id ?? "").trim() || "unknown";
+		const source = String(o.source ?? "local");
+		const quantity = Number(o.quantity);
+		if (!Number.isFinite(quantity)) continue;
+		const m = asRecord(o.measure) ?? {};
+		const measure = {
+			value: Number(m.value ?? 1),
+			unit: String(m.unit ?? "serving"),
+			traits: typeof m.traits === "number" ? m.traits : undefined,
+		};
+		const baseAmount = Number(o.baseAmount ?? o.base_amount ?? 100);
+		const baseUnit = String(o.baseUnit ?? o.base_unit ?? "gram");
+		const nRaw = asRecord(o.nutrients) ?? {};
+		const nutrients: Record<string, number> = {};
+		for (const [k, v] of Object.entries(nRaw)) {
+			const num = typeof v === "number" ? v : parseFloat(String(v));
+			if (Number.isFinite(num)) nutrients[k] = num;
+		}
+		const collectionSortIndex = Number(o.collectionSortIndex ?? o.collection_sort_index ?? 0);
+		foodEntries.push({
+			name,
+			foodID,
+			source,
+			quantity,
+			measure,
+			baseAmount: Number.isFinite(baseAmount) ? baseAmount : 100,
+			baseUnit,
+			nutrients,
+			brandOwner: o.brandOwner != null ? String(o.brandOwner) : undefined,
+			barcode: o.barcode != null ? String(o.barcode) : undefined,
+			collectionSortIndex: Number.isFinite(collectionSortIndex) ? collectionSortIndex : 0,
+		});
+	}
+	if (foodEntries.length === 0) return null;
+
+	const colRaw = root.foodCollections ?? root.food_collections ?? root.FoodCollections;
+	const foodCollections: FoodCollection[] = [];
+	if (Array.isArray(colRaw)) {
+		for (const c of colRaw) {
+			const cr = asRecord(c);
+			if (!cr) continue;
+			const n = String(cr.name ?? "").trim();
+			if (n)
+				foodCollections.push({
+					name: n,
+					collectionType: typeof cr.collectionType === "number" ? cr.collectionType : undefined,
+					version: typeof cr.version === "number" ? cr.version : undefined,
+					traits: typeof cr.traits === "number" ? cr.traits : undefined,
+				});
+		}
+	}
+
+	const out: FoodnomsData = {
+		version: typeof root.version === "number" ? root.version : undefined,
+		contentType: typeof root.contentType === "number" ? root.contentType : undefined,
+		foodCollections: foodCollections.length ? foodCollections : undefined,
+		foodEntries,
+	};
+	if (typeof root.date === "string") out.date = root.date;
+	if (typeof root.loggedAt === "string") out.loggedAt = root.loggedAt;
+	else if (typeof root.loggedAt === "number" && Number.isFinite(root.loggedAt)) {
+		(out as Record<string, unknown>).loggedAtTimestamp = root.loggedAt;
+	}
+	if (typeof root.createdAt === "string") out.createdAt = root.createdAt;
+	else if (typeof root.createdAt === "number" && Number.isFinite(root.createdAt)) {
+		(out as Record<string, unknown>).createdAtTimestamp = root.createdAt;
+	}
+	const stringTimeFields = [
+		"time",
+		"mealTime",
+		"meal_time",
+		"logged_at",
+		"updatedAt",
+		"timestamp",
+	] as const;
+	for (const k of stringTimeFields) {
+		const v = root[k];
+		if (typeof v === "string" && v.trim()) (out as Record<string, unknown>)[k] = v;
+		else if (k === "timestamp" && typeof v === "number" && Number.isFinite(v)) {
+			(out as Record<string, unknown>).timestamp = v;
+		}
+	}
+	if (typeof root.time === "string" && root.time.trim()) out.time = root.time.trim();
+	return out;
+}
+
 export function parseFoodnomsJsonText(jsonText: string): FoodnomsData | null {
 	try {
-		const data = JSON.parse(jsonText) as FoodnomsData;
-		if (!Array.isArray(data.foodEntries) || data.foodEntries.length === 0) return null;
-		return data;
+		const raw = JSON.parse(jsonText.trim().replace(/^\uFEFF/, ""));
+		return normalizeFoodnomsPayload(raw);
 	} catch {
 		return null;
 	}
@@ -121,6 +290,11 @@ export function parseFoodnomsFromBytes(bytes: Uint8Array): FoodnomsData | null {
 	const wrapped = extractLzfseUncompressedJsonText(bytes);
 	if (wrapped) {
 		const d = parseFoodnomsJsonText(wrapped);
+		if (d) return d;
+	}
+	const cliJson = tryDecompressLzfseCli(bytes);
+	if (cliJson) {
+		const d = parseFoodnomsJsonText(cliJson);
 		if (d) return d;
 	}
 	const nodeJson = tryDecompressLzfseNode(bytes);
@@ -166,6 +340,74 @@ export function mealNameFromData(data: FoodnomsData): string {
 	const c = data.foodCollections?.[0];
 	if (c?.name?.trim()) return c.name.trim();
 	return "Meal";
+}
+
+const pad2 = (n: number) => n.toString().padStart(2, "0");
+
+/**
+ * Meal clock time in 24h `HH:mm` from export fields only (no file mtime).
+ * Uses ISO timestamps, plain clock strings, or numeric epoch (ms or s).
+ */
+export function resolveMealTime24h(data: FoodnomsData): string | null {
+	const d = data as Record<string, unknown>;
+	const toHHmm = (date: Date): string | null => {
+		if (isNaN(date.getTime())) return null;
+		return `${pad2(date.getHours())}:${pad2(date.getMinutes())}`;
+	};
+	const fromIsoLike = (s: unknown): string | null => {
+		if (typeof s !== "string" || !s.trim()) return null;
+		const date = new Date(s.trim());
+		return toHHmm(date);
+	};
+	const fromClock = (s: unknown): string | null => {
+		if (typeof s !== "string") return null;
+		const m = s.trim().match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?$/);
+		if (!m) return null;
+		const h = Math.min(23, Math.max(0, parseInt(m[1], 10)));
+		const min = Math.min(59, Math.max(0, parseInt(m[2], 10)));
+		return `${pad2(h)}:${pad2(min)}`;
+	};
+	// Explicit clock fields first
+	for (const key of ["time", "mealTime", "meal_time"] as const) {
+		const t = fromClock(d[key]);
+		if (t) return t;
+	}
+	// ISO strings (loggedAt, createdAt, etc.)
+	for (const key of ["loggedAt", "createdAt", "updatedAt", "logged_at", "timestamp"] as const) {
+		const t = fromIsoLike(d[key]);
+		if (t) return t;
+	}
+	// date may include time: 2026-03-31T15:30:00
+	if (typeof data.date === "string" && data.date.includes("T")) {
+		const t = fromIsoLike(data.date);
+		if (t) return t;
+	}
+	// Numeric epoch (FoodNoms / Apple sometimes use seconds)
+	const ts = d.loggedAtTimestamp ?? d.createdAtTimestamp ?? d.timestamp;
+	if (typeof ts === "number" && Number.isFinite(ts)) {
+		const ms = ts > 1e12 ? ts : ts * 1000;
+		const t = toHHmm(new Date(ms));
+		if (t) return t;
+	}
+	return null;
+}
+
+/** Local `Date` for path templates: meal calendar day + optional clock time from export. */
+export function mealDateForPathExpansion(dateIso: string, data: FoodnomsData): Date {
+	const parts = dateIso.split("-").map(Number);
+	const y = parts[0];
+	const mo = parts[1];
+	const d = parts[2];
+	if (!y || !mo || !d) return new Date();
+	const dt = new Date(y, mo - 1, d);
+	const t = resolveMealTime24h(data);
+	if (t) {
+		const hm = t.split(":").map(Number);
+		if (Number.isFinite(hm[0]) && Number.isFinite(hm[1])) {
+			dt.setHours(hm[0]!, hm[1]!, 0, 0);
+		}
+	}
+	return dt;
 }
 
 export function resolveMealDate(data: FoodnomsData, fileMtimeMs: number): string {
